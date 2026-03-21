@@ -214,7 +214,7 @@ func decodeFileContent(content string) (gateway.IncomingAttachment, error) {
 
 func decodePostContent(content string) (string, []gateway.IncomingAttachment, error) {
 	var direct postBody
-	if err := json.Unmarshal([]byte(content), &direct); err == nil && len(direct.Content) > 0 {
+	if err := json.Unmarshal([]byte(content), &direct); err == nil && (len(direct.Content) > 0 || strings.TrimSpace(direct.Title) != "") {
 		return flattenPostBody(direct), collectPostAttachments(direct), nil
 	}
 

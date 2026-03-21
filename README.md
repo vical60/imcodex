@@ -16,7 +16,7 @@ Each configured group maps to one working directory and one persistent `tmux`-ho
 | Verification token | Not required |
 | Multi-line user input | Sent to Codex as bracketed paste |
 | Very long text input | Loaded into `tmux` from a temp buffer file |
-| Output forwarded to chat | Incremental assistant output from the Codex pane |
+| Output forwarded to chat | Codex reply text, flushed when the run pauses or completes |
 | Output hidden from chat | Codex terminal chrome and input box |
 
 ## Safety
@@ -163,14 +163,14 @@ After startup, send messages in the configured group as if you were talking dire
 | Images and file-like attachments | Saved under `cwd/.imcodex/inbox/` and forwarded as a short prompt with the saved path |
 | Slash commands | Forwarded as-is, for example `/new`, `/compact`, `/status` |
 | Multi-line messages | Preserved as one pasted input |
-| Group queue | Messages are serialized per group |
+| Group queue | One active run per group |
 | Interrupt on new message | Enabled by default; sends `Esc`, then `Ctrl-C` if Codex stays busy |
 | Startup backlog | While a session is starting or recovering, only the latest pending message is kept |
 | Multiple groups | Run independently |
 | Restarts | Existing `tmux` sessions are reused |
 | Single instance | One running `imcodex` process per config file |
 | Working notice | Sends `[working]` only if a request stays busy for a few seconds |
-| Replies | Forwarded as new Codex output appears |
+| Replies | Sent after Codex pauses or finishes, chunked when needed |
 
 ## Inspect the session
 

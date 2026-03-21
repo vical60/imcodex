@@ -156,7 +156,7 @@ func (c *Client) ListChatMessagesSince(ctx context.Context, groupID string, star
 		for _, item := range resp.Data.Items {
 			msg, ok, err := listMessageToIncomingMessage(item)
 			if err != nil {
-				return nil, fmt.Errorf("decode message %s: %w", messageIDOf(item), err)
+				continue
 			}
 			if !ok {
 				continue

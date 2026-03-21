@@ -142,6 +142,32 @@ func TestEventToIncomingMessageAcceptsGroupPostWithTextAndImage(t *testing.T) {
 	}
 }
 
+func TestEventToIncomingMessageAcceptsGroupPostWithTitleOnly(t *testing.T) {
+	t.Parallel()
+
+	msg, ok, err := eventToIncomingMessage(&larkim.P2MessageReceiveV1{
+		Event: &larkim.P2MessageReceiveV1Data{
+			Sender: &larkim.EventSender{SenderType: stringPtr("user")},
+			Message: &larkim.EventMessage{
+				MessageId:   stringPtr("om_post_title"),
+				ChatId:      stringPtr("oc_1"),
+				ChatType:    stringPtr("group"),
+				MessageType: stringPtr("post"),
+				Content:     stringPtr(`{"title":"title only","content":[]}`),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("eventToIncomingMessage() error = %v", err)
+	}
+	if !ok {
+		t.Fatal("ok = false, want true")
+	}
+	if got, want := msg.Text, "title only"; got != want {
+		t.Fatalf("msg.Text = %q, want %q", got, want)
+	}
+}
+
 func TestListMessageToIncomingMessageAcceptsGroupPostWithTextAndImage(t *testing.T) {
 	t.Parallel()
 

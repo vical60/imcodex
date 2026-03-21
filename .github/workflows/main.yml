@@ -1,0 +1,79 @@
+name: Mirror Upstream Release
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 * * * *"
+
+permissions:
+  contents: write
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure upstream
+        run: |
+          git remote add upstream https://github.com/magnaflowlabs/imcodex.git
+          git fetch upstream --tags
+
+      - name: Get latest upstream release
+        id: upstream
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag=$(gh release view --repo magnaflowlabs/imcodex --json tagName -q .tagName)
+          title=$(gh release view "$tag" --repo magnaflowlabs/imcodex --json name -q .name)
+          gh release view "$tag" --repo magnaflowlabs/imcodex --json body -q .body > RELEASE_NOTES.md
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "title=$title" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if fork already has this release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${{ steps.upstream.outputs.tag }}" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release already exists in fork."
+            exit 0
+          fi
+
+      - name: Sync release tag to fork
+        run: |
+          git push origin "refs/tags/${{ steps.upstream.outputs.tag }}:refs/tags/${{ steps.upstream.outputs.tag }}" || true
+
+      - name: Download upstream release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+          gh release download "${{ steps.upstream.outputs.tag }}" \
+            --repo magnaflowlabs/imcodex \
+            --dir dist \
+            --skip-existing || true
+
+      - name: Create release in fork
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          shopt -s nullglob
+          assets=(dist/*)
+          if [ ${#assets[@]} -gt 0 ]; then
+            gh release create "${{ steps.upstream.outputs.tag }}" \
+              "${assets[@]}" \
+              --repo "${{ github.repository }}" \
+              --title "${{ steps.upstream.outputs.title }}" \
+              --notes-file RELEASE_NOTES.md \
+              --verify-tag
+          else
+            gh release create "${{ steps.upstream.outputs.tag }}" \
+              --repo "${{ github.repository }}" \
+              --title "${{ steps.upstream.outputs.title }}" \
+              --notes-file RELEASE_NOTES.md \
+              --verify-tag
+          fi

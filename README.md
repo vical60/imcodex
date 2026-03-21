@@ -15,6 +15,7 @@ Each configured group maps to one working directory and one persistent `tmux`-ho
 | Inbound port | Not required |
 | Verification token | Not required |
 | Multi-line user input | Sent to Codex as bracketed paste |
+| Very long text input | Loaded into `tmux` from a temp buffer file |
 | Output forwarded to chat | Incremental assistant output from the Codex pane |
 | Output hidden from chat | Codex terminal chrome and input box |
 
@@ -157,9 +158,11 @@ After startup, send messages in the configured group as if you were talking dire
 | Behavior | Details |
 | --- | --- |
 | Plain text | Forwarded to Codex |
+| Images and file-like attachments | Saved under `cwd/.imcodex/inbox/` and forwarded as a short prompt with the saved path |
 | Slash commands | Forwarded as-is, for example `/new`, `/compact`, `/status` |
 | Multi-line messages | Preserved as one pasted input |
 | Group queue | Messages are serialized per group |
+| Startup backlog | While a session is starting or recovering, only the latest pending message is kept |
 | Multiple groups | Run independently |
 | Restarts | Existing `tmux` sessions are reused |
 | Single instance | One running `imcodex` process per config file |
@@ -189,6 +192,10 @@ Check:
 ### Messages are duplicated
 
 Run only one `imcodex` process for the same config file. A second process with the same groups will forward the same Codex output again.
+
+### Images and files are not inspected
+
+`imcodex` currently downloads `image` plus file-like attachments (`file`, `audio`, `video`, `media`) into `cwd/.imcodex/inbox/` and sends Codex a short text prompt with the saved path. Other non-text message types are still ignored.
 
 ### The session disappeared after a restart
 

@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/magnaflowlabs/imcodex/internal/gateway"
 	"github.com/magnaflowlabs/imcodex/internal/lark"
@@ -28,32 +29,49 @@ func main() {
 	defer cancel()
 
 	options := make([]gateway.Options, 0, len(cfg.groups))
+	groupIDs := make([]string, 0, len(cfg.groups))
 	for _, group := range cfg.groups {
 		options = append(options, gateway.Options{
 			GroupID:     group.GroupID,
 			CWD:         group.CWD,
 			SessionName: gateway.DefaultSessionNameForGroup(group.GroupID, group.CWD),
 		})
+		groupIDs = append(groupIDs, group.GroupID)
 	}
 
-	router, err := gateway.NewRouter(ctx, options, lark.NewClient(cfg.larkAppID, cfg.larkAppSecret, cfg.larkBaseURL), tmuxctl.New(), nil)
+	larkClient := lark.NewClient(cfg.larkAppID, cfg.larkAppSecret, cfg.larkBaseURL)
+	router, err := gateway.NewRouter(ctx, options, larkClient, tmuxctl.New(), larkClient, nil)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	receiver := lark.NewReceiver(cfg.larkAppID, cfg.larkAppSecret, cfg.larkBaseURL, router)
+	poller := lark.NewPoller(larkClient, groupIDs, router, nil)
 	log.Printf("imcodex started: config=%s groups=%d base=%s", cfg.path, router.GroupCount(), cfg.larkBaseURL)
 
-	errCh := make(chan error, 1)
 	go func() {
-		errCh <- receiver.Start(ctx)
+		runReceiverLoop(ctx, receiver)
+	}()
+	go func() {
+		if err := poller.Start(ctx); err != nil && ctx.Err() == nil {
+			log.Printf("WARN lark poller stopped: %v", err)
+		}
 	}()
 
-	select {
-	case err := <-errCh:
-		if err != nil {
-			log.Fatalf("lark long connection failed: %v", err)
+	<-ctx.Done()
+}
+
+func runReceiverLoop(ctx context.Context, receiver *lark.Receiver) {
+	for {
+		err := receiver.Start(ctx)
+		if err == nil || ctx.Err() != nil {
+			return
 		}
-	case <-ctx.Done():
+		log.Printf("WARN lark long connection failed: %v", err)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(3 * time.Second):
+		}
 	}
 }

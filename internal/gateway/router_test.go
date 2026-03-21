@@ -17,7 +17,7 @@ func TestRouterRoutesKnownGroup(t *testing.T) {
 	router, err := NewRouter(ctx, []Options{
 		{GroupID: "oc_1", CWD: "/srv/a"},
 		{GroupID: "oc_2", CWD: "/srv/b"},
-	}, messenger, console, slog.Default())
+	}, messenger, console, nil, slog.Default())
 	if err != nil {
 		t.Fatalf("NewRouter() error = %v", err)
 	}
@@ -43,7 +43,7 @@ func TestRouterRejectsDuplicateGroup(t *testing.T) {
 	_, err := NewRouter(ctx, []Options{
 		{GroupID: "oc_1", CWD: "/srv/a"},
 		{GroupID: "oc_1", CWD: "/srv/b"},
-	}, &fakeMessenger{}, &fakeConsole{}, slog.Default())
+	}, &fakeMessenger{}, &fakeConsole{}, nil, slog.Default())
 	if err == nil {
 		t.Fatal("NewRouter() error = nil, want duplicate group error")
 	}

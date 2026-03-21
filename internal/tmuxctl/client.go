@@ -84,8 +84,14 @@ func (c *Client) EnsureSession(ctx context.Context, spec SessionSpec) (bool, err
 
 func (c *Client) SendText(ctx context.Context, session string, text string) error {
 	bufferName := "imcodex-" + sanitizeToken(session)
-	if err := c.run(ctx, "set-buffer", "-b", bufferName, "--", text); err != nil {
-		return fmt.Errorf("set tmux buffer: %w", err)
+	bufferPath, err := c.writeBufferFile(text)
+	if err != nil {
+		return err
+	}
+	defer os.Remove(bufferPath)
+
+	if err := c.run(ctx, "load-buffer", "-b", bufferName, bufferPath); err != nil {
+		return fmt.Errorf("load tmux buffer: %w", err)
 	}
 
 	target, err := c.controlPaneTarget(ctx, session)
@@ -104,6 +110,21 @@ func (c *Client) SendText(ctx context.Context, session string, text string) erro
 	return nil
 }
 
+func (c *Client) writeBufferFile(text string) (string, error) {
+	file, err := os.CreateTemp("", "imcodex-buffer-*")
+	if err != nil {
+		return "", fmt.Errorf("create tmux buffer file: %w", err)
+	}
+	path := file.Name()
+	defer file.Close()
+
+	if _, err := file.WriteString(text); err != nil {
+		_ = os.Remove(path)
+		return "", fmt.Errorf("write tmux buffer file: %w", err)
+	}
+	return path, nil
+}
+
 func (c *Client) Capture(ctx context.Context, session string, history int) (string, error) {
 	if history <= 0 {
 		history = 200
@@ -118,6 +139,14 @@ func (c *Client) Capture(ctx context.Context, session string, history int) (stri
 		return "", fmt.Errorf("capture tmux pane: %w", err)
 	}
 	return out, nil
+}
+
+func (c *Client) Interrupt(ctx context.Context, session string) error {
+	return c.sendKey(ctx, session, "Escape")
+}
+
+func (c *Client) ForceInterrupt(ctx context.Context, session string) error {
+	return c.sendKey(ctx, session, "C-c")
 }
 
 func validateWorkingDirectory(cwd string) error {

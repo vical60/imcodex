@@ -130,6 +130,63 @@ func TestClientSendTextUsesBracketedPaste(t *testing.T) {
 
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "tmux.log")
+	contentPath := filepath.Join(dir, "buffer.txt")
+	scriptPath := filepath.Join(dir, "tmux")
+	script := fmt.Sprintf(`#!/bin/sh
+printf '%%s\n' "$*" >> %s
+case "$1" in
+  load-buffer)
+    cat "$4" > %s
+    ;;
+  show-options)
+    printf '%%%%42\n'
+    ;;
+  display-message)
+    printf '%%%%42\n'
+    ;;
+esac
+`, shellQuote(logPath), shellQuote(contentPath))
+	if err := os.WriteFile(scriptPath, []byte(script), 0o755); err != nil {
+		t.Fatalf("WriteFile() error = %v", err)
+	}
+
+	client := New()
+	client.bin = scriptPath
+	client.enterWait = 0
+
+	if err := client.SendText(context.Background(), "demo", "line1\nline2"); err != nil {
+		t.Fatalf("SendText() error = %v", err)
+	}
+
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatalf("ReadFile() error = %v", err)
+	}
+	logText := string(logData)
+	if !strings.Contains(logText, "load-buffer -b imcodex-demo") {
+		t.Fatalf("tmux log = %q, want load-buffer from temp file", logText)
+	}
+	if strings.Contains(logText, "set-buffer -b imcodex-demo") {
+		t.Fatalf("tmux log = %q, want set-buffer removed for long-safe input", logText)
+	}
+	if !strings.Contains(logText, "paste-buffer -p -d -b imcodex-demo -t %42") {
+		t.Fatalf("tmux log = %q, want bracketed paste", logText)
+	}
+
+	contentData, err := os.ReadFile(contentPath)
+	if err != nil {
+		t.Fatalf("ReadFile(buffer) error = %v", err)
+	}
+	if got, want := string(contentData), "line1\nline2"; got != want {
+		t.Fatalf("buffer content = %q, want %q", got, want)
+	}
+}
+
+func TestClientInterruptUsesEscapeAndCtrlC(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "tmux.log")
 	scriptPath := filepath.Join(dir, "tmux")
 	script := fmt.Sprintf(`#!/bin/sh
 printf '%%s\n' "$*" >> %s
@@ -148,10 +205,12 @@ esac
 
 	client := New()
 	client.bin = scriptPath
-	client.enterWait = 0
 
-	if err := client.SendText(context.Background(), "demo", "line1\nline2"); err != nil {
-		t.Fatalf("SendText() error = %v", err)
+	if err := client.Interrupt(context.Background(), "demo"); err != nil {
+		t.Fatalf("Interrupt() error = %v", err)
+	}
+	if err := client.ForceInterrupt(context.Background(), "demo"); err != nil {
+		t.Fatalf("ForceInterrupt() error = %v", err)
 	}
 
 	logData, err := os.ReadFile(logPath)
@@ -159,8 +218,11 @@ esac
 		t.Fatalf("ReadFile() error = %v", err)
 	}
 	logText := string(logData)
-	if !strings.Contains(logText, "paste-buffer -p -d -b imcodex-demo -t %42") {
-		t.Fatalf("tmux log = %q, want bracketed paste", logText)
+	if !strings.Contains(logText, "send-keys -t %42 Escape") {
+		t.Fatalf("tmux log = %q, want Escape interrupt", logText)
+	}
+	if !strings.Contains(logText, "send-keys -t %42 C-c") {
+		t.Fatalf("tmux log = %q, want C-c force interrupt", logText)
 	}
 }
 

@@ -10,7 +10,7 @@ type Router struct {
 	services map[string]*Service
 }
 
-func NewRouter(ctx context.Context, groups []Options, messenger Messenger, console Console, logger *slog.Logger) (*Router, error) {
+func NewRouter(ctx context.Context, groups []Options, messenger Messenger, console Console, resources ResourceFetcher, logger *slog.Logger) (*Router, error) {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -20,7 +20,7 @@ func NewRouter(ctx context.Context, groups []Options, messenger Messenger, conso
 		if _, exists := services[group.GroupID]; exists {
 			return nil, fmt.Errorf("duplicate group id: %s", group.GroupID)
 		}
-		services[group.GroupID] = NewService(ctx, group, messenger, console, logger)
+		services[group.GroupID] = NewService(ctx, group, messenger, console, resources, logger)
 	}
 	return &Router{services: services}, nil
 }

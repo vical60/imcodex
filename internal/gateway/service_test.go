@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -37,11 +39,23 @@ type fakeConsole struct {
 	captures      []string
 	captureErrors []error
 	sendTexts     []string
+	interrupts    []string
 	ensureErrors  []error
 	sendErrors    []error
+	ensureEntered chan struct{}
+	ensureBlock   <-chan struct{}
 }
 
 func (f *fakeConsole) EnsureSession(context.Context, tmuxctl.SessionSpec) (bool, error) {
+	if f.ensureEntered != nil {
+		select {
+		case f.ensureEntered <- struct{}{}:
+		default:
+		}
+	}
+	if f.ensureBlock != nil {
+		<-f.ensureBlock
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if len(f.ensureErrors) > 0 {
@@ -94,12 +108,56 @@ func (f *fakeConsole) Capture(context.Context, string, int) (string, error) {
 	return out, nil
 }
 
+func (f *fakeConsole) Interrupt(_ context.Context, session string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.interrupts = append(f.interrupts, "esc:"+session)
+	return nil
+}
+
+func (f *fakeConsole) ForceInterrupt(_ context.Context, session string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.interrupts = append(f.interrupts, "ctrl-c:"+session)
+	return nil
+}
+
 func (f *fakeConsole) allSendTexts() []string {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := make([]string, len(f.sendTexts))
 	copy(out, f.sendTexts)
 	return out
+}
+
+func (f *fakeConsole) allInterrupts() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.interrupts))
+	copy(out, f.interrupts)
+	return out
+}
+
+type fakeResourceFetcher struct {
+	mu        sync.Mutex
+	resources map[string]DownloadedResource
+	errors    map[string]error
+	requests  []string
+}
+
+func (f *fakeResourceFetcher) DownloadMessageResource(_ context.Context, messageID string, resourceType string, resourceKey string) (DownloadedResource, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	key := messageID + "|" + resourceType + "|" + resourceKey
+	f.requests = append(f.requests, key)
+	if err, ok := f.errors[key]; ok && err != nil {
+		return DownloadedResource{}, err
+	}
+	resource, ok := f.resources[key]
+	if !ok {
+		return DownloadedResource{}, errors.New("resource not found")
+	}
+	return resource, nil
 }
 
 func TestServiceBridgesMessageToConsole(t *testing.T) {
@@ -119,7 +177,7 @@ func TestServiceBridgesMessageToConsole(t *testing.T) {
 	}
 	messenger := &fakeMessenger{}
 
-	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, slog.Default())
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
 	svc.pollEvery = 5 * time.Millisecond
 	svc.history = 2000
 	svc.startWait = 0
@@ -134,7 +192,7 @@ func TestServiceBridgesMessageToConsole(t *testing.T) {
 
 	waitFor(t, 500*time.Millisecond, func() bool {
 		joined := strings.Join(messenger.all(), "\n")
-		return strings.Contains(joined, "[working]") && strings.Contains(joined, "Hello")
+		return strings.Contains(joined, "Hello")
 	})
 
 	joined := strings.Join(nonStatusMessages(messenger.all()), "\n")
@@ -151,7 +209,7 @@ func TestServiceRejectsUnknownGroup(t *testing.T) {
 
 	messenger := &fakeMessenger{}
 	console := &fakeConsole{}
-	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, slog.Default())
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
 
 	if err := svc.HandleMessage(context.Background(), IncomingMessage{
 		MessageID: "om_1",
@@ -163,6 +221,227 @@ func TestServiceRejectsUnknownGroup(t *testing.T) {
 
 	if got := messenger.all(); len(got) != 0 {
 		t.Fatalf("messages = %#v, want ignored unknown-group message", got)
+	}
+}
+
+func TestServiceDownloadsAttachmentsIntoInboxAndForwardsPrompt(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cwd := t.TempDir()
+	console := &fakeConsole{captures: []string{"", ""}}
+	messenger := &fakeMessenger{}
+	resources := &fakeResourceFetcher{
+		resources: map[string]DownloadedResource{
+			"om_file|file|file_v3_123": {
+				Data:        []byte("pdf-bytes"),
+				FileName:    "report.pdf",
+				ContentType: "application/pdf",
+			},
+		},
+	}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: cwd, SessionName: "imcodex-demo"}, messenger, console, resources, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_file",
+		GroupID:   "oc_1",
+		Attachments: []IncomingAttachment{
+			{ResourceType: "file", ResourceKey: "file_v3_123", FileName: "report.pdf"},
+		},
+	}); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		return len(console.allSendTexts()) >= 1
+	})
+
+	got := console.allSendTexts()[0]
+	if !strings.Contains(got, "User attached a file:") || !strings.Contains(got, ".imcodex/inbox/") || !strings.Contains(got, "report.pdf") {
+		t.Fatalf("sendTexts[0] = %q, want attachment prompt with inbox path", got)
+	}
+
+	inboxDir := filepath.Join(cwd, ".imcodex", "inbox")
+	entries, err := os.ReadDir(inboxDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s) error = %v", inboxDir, err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("len(entries) = %d, want 1", len(entries))
+	}
+
+	data, err := os.ReadFile(filepath.Join(inboxDir, entries[0].Name()))
+	if err != nil {
+		t.Fatalf("ReadFile(saved attachment) error = %v", err)
+	}
+	if got, want := string(data), "pdf-bytes"; got != want {
+		t.Fatalf("saved attachment = %q, want %q", got, want)
+	}
+}
+
+func TestServiceForwardsTextAndMultipleAttachments(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cwd := t.TempDir()
+	console := &fakeConsole{captures: []string{"", ""}}
+	messenger := &fakeMessenger{}
+	resources := &fakeResourceFetcher{
+		resources: map[string]DownloadedResource{
+			"om_mix|file|file_v3_1": {
+				Data:        []byte("doc-bytes"),
+				FileName:    "notes.txt",
+				ContentType: "text/plain",
+			},
+			"om_mix|image|img_v3_1": {
+				Data:        []byte("png-bytes"),
+				ContentType: "image/png",
+			},
+		},
+	}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: cwd, SessionName: "imcodex-demo"}, messenger, console, resources, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_mix",
+		GroupID:   "oc_1",
+		Text:      "Please inspect both attachments.",
+		Attachments: []IncomingAttachment{
+			{ResourceType: "file", ResourceKey: "file_v3_1", FileName: "notes.txt"},
+			{ResourceType: "image", ResourceKey: "img_v3_1"},
+		},
+	}); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		return len(console.allSendTexts()) >= 1
+	})
+
+	got := console.allSendTexts()[0]
+	if !strings.Contains(got, "Please inspect both attachments.") {
+		t.Fatalf("sendTexts[0] = %q, want original text preserved", got)
+	}
+	if !strings.Contains(got, "User attached a file:") || !strings.Contains(got, "notes.txt") {
+		t.Fatalf("sendTexts[0] = %q, want file prompt", got)
+	}
+	if !strings.Contains(got, "User attached an image:") || !strings.Contains(got, ".png") {
+		t.Fatalf("sendTexts[0] = %q, want image prompt with inferred extension", got)
+	}
+
+	inboxDir := filepath.Join(cwd, ".imcodex", "inbox")
+	entries, err := os.ReadDir(inboxDir)
+	if err != nil {
+		t.Fatalf("ReadDir(%s) error = %v", inboxDir, err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("len(entries) = %d, want 2", len(entries))
+	}
+}
+
+func TestServiceDownloadFailureDoesNotBlockNextMessage(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cwd := t.TempDir()
+	console := &fakeConsole{captures: []string{"", "", ""}}
+	messenger := &fakeMessenger{}
+	resources := &fakeResourceFetcher{
+		errors: map[string]error{
+			"om_bad|file|file_missing": errors.New("download denied"),
+		},
+	}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: cwd, SessionName: "imcodex-demo"}, messenger, console, resources, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_bad",
+		GroupID:   "oc_1",
+		Attachments: []IncomingAttachment{
+			{ResourceType: "file", ResourceKey: "file_missing", FileName: "blocked.pdf"},
+		},
+	}); err != nil {
+		t.Fatalf("HandleMessage(bad attachment) error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		return strings.Contains(strings.Join(messenger.all(), "\n"), "Failed to prepare message for Codex")
+	})
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_next",
+		GroupID:   "oc_1",
+		Text:      "after attachment failure",
+	}); err != nil {
+		t.Fatalf("HandleMessage(next) error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		return len(console.allSendTexts()) >= 1
+	})
+
+	got := console.allSendTexts()
+	if len(got) != 1 || got[0] != "after attachment failure" {
+		t.Fatalf("sendTexts = %#v, want only follow-up text after attachment failure", got)
+	}
+}
+
+func TestServiceImageWithoutFilenameUsesContentTypeExtension(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	cwd := t.TempDir()
+	console := &fakeConsole{captures: []string{"", ""}}
+	messenger := &fakeMessenger{}
+	resources := &fakeResourceFetcher{
+		resources: map[string]DownloadedResource{
+			"om_img|image|img_v3_only": {
+				Data:        []byte("jpeg-bytes"),
+				ContentType: "image/jpeg",
+			},
+		},
+	}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: cwd, SessionName: "imcodex-demo"}, messenger, console, resources, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_img",
+		GroupID:   "oc_1",
+		Attachments: []IncomingAttachment{
+			{ResourceType: "image", ResourceKey: "img_v3_only"},
+		},
+	}); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		return len(console.allSendTexts()) >= 1
+	})
+
+	got := console.allSendTexts()[0]
+	if !strings.Contains(got, "User attached an image:") || !(strings.Contains(got, ".jpg") || strings.Contains(got, ".jpeg")) {
+		t.Fatalf("sendTexts[0] = %q, want image prompt with jpg/jpeg extension", got)
 	}
 }
 
@@ -183,7 +462,7 @@ func TestServiceStreamsScrolledSnapshotWithoutRepeatingPrefix(t *testing.T) {
 	}
 	messenger := &fakeMessenger{}
 
-	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, slog.Default())
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
 	svc.pollEvery = 5 * time.Millisecond
 	svc.history = 2000
 	svc.startWait = 0
@@ -197,15 +476,15 @@ func TestServiceStreamsScrolledSnapshotWithoutRepeatingPrefix(t *testing.T) {
 	}
 
 	waitFor(t, 500*time.Millisecond, func() bool {
-		return len(nonStatusMessages(messenger.all())) >= 2
+		return len(nonStatusMessages(messenger.all())) >= 1
 	})
 
 	outputs := nonStatusMessages(messenger.all())
-	if got, want := outputs[0], "• Alpha\n• Beta"; got != want {
+	if got, want := outputs[0], "• Alpha\n• Beta\n• Gamma"; got != want {
 		t.Fatalf("outputs[0] = %q, want %q", got, want)
 	}
-	if got, want := outputs[1], "• Gamma"; got != want {
-		t.Fatalf("outputs[1] = %q, want %q", got, want)
+	if len(outputs) != 1 {
+		t.Fatalf("len(outputs) = %d, want 1", len(outputs))
 	}
 }
 
@@ -226,7 +505,7 @@ func TestServiceDoesNotReplayPreviousHistoryOnNewRequest(t *testing.T) {
 	}
 	messenger := &fakeMessenger{}
 
-	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, slog.Default())
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
 	svc.pollEvery = 5 * time.Millisecond
 	svc.history = 2000
 	svc.startWait = 0
@@ -269,7 +548,7 @@ func TestServiceQueuesSecondMessageUntilBusyClears(t *testing.T) {
 	}
 	messenger := &fakeMessenger{}
 
-	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, slog.Default())
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
 	svc.pollEvery = 20 * time.Millisecond
 	svc.history = 2000
 	svc.startWait = 0
@@ -277,6 +556,11 @@ func TestServiceQueuesSecondMessageUntilBusyClears(t *testing.T) {
 	if err := svc.HandleMessage(context.Background(), IncomingMessage{MessageID: "om_1", GroupID: "oc_1", Text: "first"}); err != nil {
 		t.Fatalf("HandleMessage(first) error = %v", err)
 	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		got := console.allSendTexts()
+		return len(got) >= 1 && got[0] == "first"
+	})
 	if err := svc.HandleMessage(context.Background(), IncomingMessage{MessageID: "om_2", GroupID: "oc_1", Text: "second"}); err != nil {
 		t.Fatalf("HandleMessage(second) error = %v", err)
 	}
@@ -292,6 +576,108 @@ func TestServiceQueuesSecondMessageUntilBusyClears(t *testing.T) {
 	})
 }
 
+func TestServiceInterruptsCurrentRunOnNewMessageWhenEnabled(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"• Working (1s • esc to interrupt)",
+			"• Working (2s • esc to interrupt)",
+			"",
+			"",
+		},
+	}
+	messenger := &fakeMessenger{}
+
+	svc := NewService(ctx, Options{
+		GroupID:               "oc_1",
+		CWD:                   "/srv/demo",
+		SessionName:           "imcodex-demo",
+		InterruptOnNewMessage: true,
+	}, messenger, console, nil, slog.Default())
+	svc.pollEvery = 20 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+	svc.interruptForceAfter = 500 * time.Millisecond
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{MessageID: "om_1", GroupID: "oc_1", Text: "first"}); err != nil {
+		t.Fatalf("HandleMessage(first) error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		got := console.allSendTexts()
+		return len(got) >= 1 && got[0] == "first"
+	})
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{MessageID: "om_2", GroupID: "oc_1", Text: "second"}); err != nil {
+		t.Fatalf("HandleMessage(second) error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		return len(console.allInterrupts()) >= 1
+	})
+	if got := console.allInterrupts()[0]; !strings.HasPrefix(got, "esc:") {
+		t.Fatalf("interrupts[0] = %q, want esc interrupt", got)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		got := console.allSendTexts()
+		return len(got) >= 2 && got[1] == "second"
+	})
+}
+
+func TestServiceKeepsOnlyLatestPendingMessageWhileSessionStarts(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	ensureBlock := make(chan struct{})
+	console := &fakeConsole{
+		captures:      []string{"", ""},
+		ensureEntered: make(chan struct{}, 1),
+		ensureBlock:   ensureBlock,
+	}
+	messenger := &fakeMessenger{}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.pollEvery = 10 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{MessageID: "om_1", GroupID: "oc_1", Text: "first"}); err != nil {
+		t.Fatalf("HandleMessage(first) error = %v", err)
+	}
+
+	select {
+	case <-console.ensureEntered:
+	case <-time.After(200 * time.Millisecond):
+		t.Fatal("timed out waiting for ensure session to start")
+	}
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{MessageID: "om_2", GroupID: "oc_1", Text: "second"}); err != nil {
+		t.Fatalf("HandleMessage(second) error = %v", err)
+	}
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{MessageID: "om_3", GroupID: "oc_1", Text: "third"}); err != nil {
+		t.Fatalf("HandleMessage(third) error = %v", err)
+	}
+
+	close(ensureBlock)
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		got := console.allSendTexts()
+		return len(got) >= 1
+	})
+
+	if got := console.allSendTexts(); len(got) != 1 || got[0] != "third" {
+		t.Fatalf("sendTexts = %#v, want only latest startup message", got)
+	}
+}
+
 func TestServiceIgnoresDuplicateMessageIDs(t *testing.T) {
 	t.Parallel()
 
@@ -301,7 +687,7 @@ func TestServiceIgnoresDuplicateMessageIDs(t *testing.T) {
 	console := &fakeConsole{captures: []string{"", ""}}
 	messenger := &fakeMessenger{}
 
-	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, slog.Default())
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
 	svc.pollEvery = 5 * time.Millisecond
 	svc.history = 2000
 	svc.startWait = 0
@@ -335,7 +721,7 @@ func TestServiceRetriesAfterEnsureSessionFailure(t *testing.T) {
 	}
 	messenger := &fakeMessenger{}
 
-	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, slog.Default())
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
 	svc.pollEvery = 10 * time.Millisecond
 	svc.history = 2000
 	svc.startWait = 0
@@ -354,7 +740,7 @@ func TestServiceRetriesAfterEnsureSessionFailure(t *testing.T) {
 	}
 }
 
-func TestServiceRequeuesMessageAfterSendFailure(t *testing.T) {
+func TestServiceClearsQueueAfterSendFailure(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -366,7 +752,7 @@ func TestServiceRequeuesMessageAfterSendFailure(t *testing.T) {
 	}
 	messenger := &fakeMessenger{}
 
-	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, slog.Default())
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
 	svc.pollEvery = 10 * time.Millisecond
 	svc.history = 2000
 	svc.startWait = 0
@@ -376,8 +762,21 @@ func TestServiceRequeuesMessageAfterSendFailure(t *testing.T) {
 	}
 
 	waitFor(t, 500*time.Millisecond, func() bool {
+		return strings.Contains(strings.Join(messenger.all(), "\n"), "send failed")
+	})
+
+	time.Sleep(50 * time.Millisecond)
+	if got := console.allSendTexts(); len(got) != 1 || got[0] != "hello" {
+		t.Fatalf("sendTexts = %#v, want failed message sent once without retry", got)
+	}
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{MessageID: "om_2", GroupID: "oc_1", Text: "after failure"}); err != nil {
+		t.Fatalf("HandleMessage(after failure) error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
 		got := console.allSendTexts()
-		return len(got) >= 2 && got[0] == "hello" && got[1] == "hello"
+		return len(got) >= 2 && got[1] == "after failure"
 	})
 }
 

@@ -15,7 +15,8 @@ Each configured group maps to one working directory and one persistent `tmux`-ho
 | Inbound port | Not required |
 | Verification token | Not required |
 | Multi-line user input | Sent to Codex as bracketed paste |
-| Output forwarded to chat | Incremental assistant output from the Codex pane |
+| Very long text input | Loaded into `tmux` from a temp buffer file |
+| Output forwarded to chat | Codex reply text, flushed when the run pauses or completes |
 | Output hidden from chat | Codex terminal chrome and input box |
 
 ## Safety
@@ -94,6 +95,7 @@ Minimal config:
 lark_app_id: cli_xxx
 lark_app_secret: your_app_secret
 lark_base_url: https://open.larksuite.com
+interrupt_on_new_message: true
 groups:
   - group_id: oc_xxx
     cwd: /srv/my-project
@@ -118,6 +120,7 @@ export LARK_BASE_URL=https://open.larksuite.com
 | `lark_app_id` | Bot app ID |
 | `lark_app_secret` | Bot app secret |
 | `lark_base_url` | API base URL for Lark or Feishu |
+| `interrupt_on_new_message` | If `true`, a new user message interrupts the current Codex run and keeps only the newest pending message |
 | `groups[].group_id` | Group mapped to Codex |
 | `groups[].cwd` | Working directory for that group |
 
@@ -157,14 +160,17 @@ After startup, send messages in the configured group as if you were talking dire
 | Behavior | Details |
 | --- | --- |
 | Plain text | Forwarded to Codex |
+| Images and file-like attachments | Saved under `cwd/.imcodex/inbox/` and forwarded as a short prompt with the saved path |
 | Slash commands | Forwarded as-is, for example `/new`, `/compact`, `/status` |
 | Multi-line messages | Preserved as one pasted input |
-| Group queue | Messages are serialized per group |
+| Group queue | One active run per group |
+| Interrupt on new message | Enabled by default; sends `Esc`, then `Ctrl-C` if Codex stays busy |
+| Startup backlog | While a session is starting or recovering, only the latest pending message is kept |
 | Multiple groups | Run independently |
 | Restarts | Existing `tmux` sessions are reused |
 | Single instance | One running `imcodex` process per config file |
-| Working notice | Sends `[working]` when a request is dispatched |
-| Replies | Forwarded as new Codex output appears |
+| Working notice | Sends `[working]` only if a request stays busy for a few seconds |
+| Replies | Sent after Codex pauses or finishes, chunked when needed |
 
 ## Inspect the session
 
@@ -189,6 +195,10 @@ Check:
 ### Messages are duplicated
 
 Run only one `imcodex` process for the same config file. A second process with the same groups will forward the same Codex output again.
+
+### Images and files are not inspected
+
+`imcodex` currently downloads `image` plus file-like attachments (`file`, `audio`, `video`, `media`) into `cwd/.imcodex/inbox/` and sends Codex a short text prompt with the saved path. Other non-text message types are still ignored.
 
 ### The session disappeared after a restart
 

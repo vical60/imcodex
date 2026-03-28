@@ -375,11 +375,12 @@ func (s *Service) dispatchPrepared(rt *groupRuntime, req *activeRequest) error {
 	if req == nil {
 		return errors.New("active request is nil")
 	}
+	baseline := s.refreshDispatchBaseline(rt)
 	s.prepareOutputForDispatch(rt)
 	if err := s.console.SendText(s.ctx, rt.session, req.input); err != nil {
 		return err
 	}
-	rt.baseText = rt.lastText
+	rt.baseText = baseline
 	rt.lastBusy = true
 	rt.idleTicks = 0
 	rt.outputBuffer = ""
@@ -390,6 +391,22 @@ func (s *Service) dispatchPrepared(rt *groupRuntime, req *activeRequest) error {
 	rt.forceInterruptSent = false
 	rt.active = req
 	return nil
+}
+
+func (s *Service) refreshDispatchBaseline(rt *groupRuntime) string {
+	if rt == nil || strings.TrimSpace(rt.session) == "" {
+		return ""
+	}
+	if strings.TrimSpace(rt.lastText) == "" {
+		return rt.lastText
+	}
+	snapshot, err := s.console.Capture(s.ctx, rt.session, s.history)
+	if err != nil {
+		s.logger.Warn("capture dispatch baseline failed", "group_id", rt.opts.GroupID, "session", rt.session, "err", err)
+		return rt.lastText
+	}
+	rt.lastText = tmuxctl.NormalizeSnapshot(snapshot)
+	return rt.lastText
 }
 
 func (s *Service) poll(rt *groupRuntime) {

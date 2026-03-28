@@ -23,6 +23,7 @@
 | Telegram reply mode | Prefer `editMessageText` on one active Telegram message |
 | Body flush | Use a longer debounce before forwarding reply text |
 | Flush trigger | Flush body only after the session has been idle for a configurable window |
+| Request boundary | Refresh the tmux output baseline immediately before dispatching a new prompt |
 | Before next user message dispatch | Force-flush any buffered body text first |
 | Telegram length limit | When the active message approaches a soft limit, roll over to a new Telegram message |
 
@@ -57,6 +58,7 @@
 | 4 | After `body_flush_after` of idle time, merge the buffered text into the active Telegram message with `editMessageText` |
 | 5 | If the merged text would exceed `edit_rollover_at`, keep the current message as-is, send a new continuation message, and continue edits there |
 | 6 | If a new user prompt arrives before the buffered text is flushed, flush first, then dispatch the new prompt |
+| 7 | Right before dispatch, refresh the tmux baseline so the next reply cannot replay stale tail output from the prior run |
 
 ## Rationale
 
@@ -93,6 +95,7 @@ Current implementation uses internal constants for these values. YAML exposure i
 | Codex pauses briefly mid-reply | Telegram receives one combined body message instead of several small ones |
 | Codex thinks for a while before answering | Telegram gets one early `working` status |
 | A new prompt arrives right after the prior reply ends | The previous buffered reply is sent before the new prompt starts |
+| Tmux state advances between polls right before a new prompt | The next Telegram reply starts from the refreshed boundary and does not replay stale prior output |
 | Reply fits within one message | The initial `working` message is edited into the final body message |
 | Reply exceeds Telegram safe size | Telegram shows a small number of continuation messages, each maintained with edit-in-place until rollover |
 

@@ -653,6 +653,48 @@ func TestServiceDoesNotReplayPreviousHistoryOnNewRequest(t *testing.T) {
 	}
 }
 
+func TestServiceRefreshesBaselineBeforeDispatchingNewRequest(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"• previous reply final",
+			"• previous reply final\n\nRan curl -L -s https://gmncode.cn\n<html>invite</html>\n\n• invite reply",
+		},
+	}
+	messenger := &fakeMessenger{}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.flushIdleTicks = 1
+
+	rt := &groupRuntime{
+		opts:         svc.opts,
+		session:      svc.opts.SessionName,
+		sessionReady: true,
+		lastText:     "• previous reply",
+	}
+
+	if err := svc.dispatchPrepared(rt, &activeRequest{
+		messageID: "om_2",
+		input:     "new question",
+	}); err != nil {
+		t.Fatalf("dispatchPrepared() error = %v", err)
+	}
+
+	svc.poll(rt)
+
+	joined := strings.Join(nonStatusMessages(messenger.all()), "\n")
+	if strings.Contains(joined, "previous reply") {
+		t.Fatalf("messages = %#v, want stale previous reply excluded", messenger.all())
+	}
+	if !strings.Contains(joined, "Ran curl -L -s https://gmncode.cn") || !strings.Contains(joined, "• invite reply") {
+		t.Fatalf("messages = %#v, want current request output forwarded", messenger.all())
+	}
+}
+
 func TestServiceEditableMessengerEditsWorkingMessageIntoReply(t *testing.T) {
 	t.Parallel()
 

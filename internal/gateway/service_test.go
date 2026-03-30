@@ -41,6 +41,8 @@ type fakeEditableMessenger struct {
 	nextID   int
 	messages []trackedMessage
 	events   []string
+	editErrs []error
+	edits    int
 }
 
 func (f *fakeEditableMessenger) SendTextToChat(ctx context.Context, groupID string, text string) error {
@@ -62,6 +64,14 @@ func (f *fakeEditableMessenger) SendTextToChatWithID(_ context.Context, _ string
 func (f *fakeEditableMessenger) EditTextInChat(_ context.Context, _ string, messageID string, text string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.edits++
+	if len(f.editErrs) > 0 {
+		err := f.editErrs[0]
+		f.editErrs = f.editErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
 
 	for i := range f.messages {
 		if f.messages[i].messageID != messageID {
@@ -90,6 +100,19 @@ func (f *fakeEditableMessenger) allEvents() []string {
 	out := make([]string, len(f.events))
 	copy(out, f.events)
 	return out
+}
+
+func (f *fakeEditableMessenger) editCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.edits
+}
+
+func (f *fakeEditableMessenger) SendChatAction(_ context.Context, groupID string, action string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.events = append(f.events, "action:"+groupID+":"+action)
+	return nil
 }
 
 type fakeConsole struct {
@@ -439,7 +462,7 @@ func TestServiceDownloadFailureDoesNotBlockNextMessage(t *testing.T) {
 	}
 
 	waitFor(t, 500*time.Millisecond, func() bool {
-		return strings.Contains(strings.Join(messenger.all(), "\n"), "Failed to prepare message for Codex")
+		return strings.Contains(strings.Join(messenger.all(), "\n"), "Failed to prepare request for Codex")
 	})
 
 	if err := svc.HandleMessage(context.Background(), IncomingMessage{
@@ -503,7 +526,7 @@ func TestServiceImageWithoutFilenameUsesContentTypeExtension(t *testing.T) {
 	}
 }
 
-func TestServiceRetriesAttachmentRunAfterTransientDisconnect(t *testing.T) {
+func TestServiceForwardsTransientDisconnectDuringAttachmentReply(t *testing.T) {
 	t.Parallel()
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -551,19 +574,56 @@ func TestServiceRetriesAttachmentRunAfterTransientDisconnect(t *testing.T) {
 	})
 
 	sendTexts := console.allSendTexts()
-	if len(sendTexts) != 2 {
-		t.Fatalf("len(sendTexts) = %d, want 2 with one retry", len(sendTexts))
-	}
-	if sendTexts[0] != sendTexts[1] {
-		t.Fatalf("sendTexts = %#v, want retry to resend the same attachment prompt", sendTexts)
+	if len(sendTexts) != 1 {
+		t.Fatalf("len(sendTexts) = %d, want 1 without content-driven retry", len(sendTexts))
 	}
 
 	outputs := nonStatusMessages(messenger.all())
-	if got, want := outputs[0], "• Attachment summary ready"; got != want {
+	if got, want := outputs[0], "stream disconnected before completion: stream closed before response.completed\n\n• Attachment summary ready"; got != want {
 		t.Fatalf("outputs[0] = %q, want %q", got, want)
 	}
-	if strings.Contains(strings.Join(outputs, "\n"), "stream disconnected before completion") {
-		t.Fatalf("outputs = %#v, want transient disconnect hidden after retry", outputs)
+}
+
+func TestServiceForwardsTransientDisconnectDuringNormalReply(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"• Working (1s • esc to interrupt)",
+			"stream disconnected before completion: stream closed before response.completed\n\n• Working (1s • esc to interrupt)",
+			"stream disconnected before completion: stream closed before response.completed\n\n• final reply",
+			"stream disconnected before completion: stream closed before response.completed\n\n• final reply",
+		},
+	}
+	messenger := &fakeEditableMessenger{}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+	svc.workingAfter = 5 * time.Millisecond
+	svc.flushIdleTicks = 2
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_1",
+		GroupID:   "oc_1",
+		Text:      "hello",
+	}); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		got := nonStatusMessages(messenger.all())
+		return len(got) == 1 && got[0] == "stream disconnected before completion: stream closed before response.completed\n\n• final reply"
+	})
+
+	outputs := nonStatusMessages(messenger.all())
+	if got, want := outputs[0], "stream disconnected before completion: stream closed before response.completed\n\n• final reply"; got != want {
+		t.Fatalf("outputs[0] = %q, want %q", got, want)
 	}
 }
 
@@ -741,6 +801,49 @@ func TestServiceEditableMessengerEditsWorkingMessageIntoReply(t *testing.T) {
 	}
 }
 
+func TestServiceSendsChatActionWhileWaitingForFirstVisibleReply(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"• Working (1s • esc to interrupt)",
+			"• Working (2s • esc to interrupt)",
+			"• Working (3s • esc to interrupt)",
+			"• final reply",
+			"• final reply",
+		},
+	}
+	messenger := &fakeEditableMessenger{}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+	svc.workingAfter = 10 * time.Millisecond
+	svc.chatActionEvery = 10 * time.Millisecond
+	svc.flushIdleTicks = 2
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_1",
+		GroupID:   "oc_1",
+		Text:      "hello",
+	}); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		return strings.Contains(strings.Join(messenger.allEvents(), "\n"), "action:oc_1:typing")
+	})
+
+	if events := strings.Join(messenger.allEvents(), "\n"); !strings.Contains(events, "action:oc_1:typing") {
+		t.Fatalf("events = %#v, want chat action before visible reply", messenger.allEvents())
+	}
+}
+
 func TestServiceEditableMessengerRollsOverLongReply(t *testing.T) {
 	t.Parallel()
 
@@ -842,6 +945,155 @@ func TestServiceEditableMessengerKeepsPreviousReplyWhenNewRequestStarts(t *testi
 	want := []string{"• first reply", "• second reply"}
 	if strings.Join(got, "|") != strings.Join(want, "|") {
 		t.Fatalf("messages = %#v, want %#v", got, want)
+	}
+}
+
+func TestServiceEditableMessengerRecoversBufferedReplyAfterReset(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"• Working (1s • esc to interrupt)",
+			"• alpha\n\n• beta",
+			"• alpha revised\n\n• beta\n\n• gamma",
+			"• alpha revised\n\n• beta\n\n• gamma",
+		},
+	}
+	messenger := &fakeEditableMessenger{}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+	svc.workingAfter = 5 * time.Millisecond
+	svc.flushIdleTicks = 2
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_1",
+		GroupID:   "oc_1",
+		Text:      "hello",
+	}); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		got := nonStatusMessages(messenger.all())
+		return len(got) == 1 && got[0] == "• alpha revised\n\n• beta\n\n• gamma"
+	})
+
+	if got := nonStatusMessages(messenger.all()); len(got) != 1 || got[0] != "• alpha revised\n\n• beta\n\n• gamma" {
+		t.Fatalf("messages = %#v, want recovered final reply", got)
+	}
+}
+
+func TestServiceEditableMessengerFlushesBufferedReplyWhileBusy(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"• Working (1s • esc to interrupt)",
+			"• alpha\n\n• Working (1s • esc to interrupt)",
+			"• alpha\n\n• Working (2s • esc to interrupt)",
+			"• alpha\n\n• Working (3s • esc to interrupt)",
+			"• alpha\n\n• Working (4s • esc to interrupt)",
+			"• alpha\n\n• Working (5s • esc to interrupt)",
+			"• alpha\n\n• beta\n\n• Working (6s • esc to interrupt)",
+			"• alpha\n\n• beta\n\n• Working (7s • esc to interrupt)",
+			"• alpha\n\n• beta\n\n• Working (8s • esc to interrupt)",
+			"• alpha\n\n• beta\n\n• Working (9s • esc to interrupt)",
+		},
+	}
+	messenger := &fakeEditableMessenger{}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+	svc.workingAfter = 5 * time.Millisecond
+	svc.busyFlushAfter = 15 * time.Millisecond
+	svc.flushIdleTicks = 50
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_1",
+		GroupID:   "oc_1",
+		Text:      "hello",
+	}); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		got := nonStatusMessages(messenger.all())
+		return len(got) == 1 && got[0] == "• alpha\n\n• beta"
+	})
+
+	events := strings.Join(messenger.allEvents(), "\n")
+	if !strings.Contains(events, "edit:1:• alpha") {
+		t.Fatalf("events = %#v, want busy flush for first partial reply", messenger.allEvents())
+	}
+	if !strings.Contains(events, "edit:1:• alpha\n\n• beta") {
+		t.Fatalf("events = %#v, want busy flush for second partial reply", messenger.allEvents())
+	}
+}
+
+func TestServiceEditableMessengerBacksOffAfterRateLimit(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"• Working (1s • esc to interrupt)",
+			"• first",
+			"• first",
+			"• first\n\n• second",
+			"• first\n\n• second",
+		},
+	}
+	messenger := &fakeEditableMessenger{
+		editErrs: []error{
+			errors.New("telegram api failed: http=429 code=429 desc=Too Many Requests: retry after 1 retry_after=1"),
+		},
+	}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+	svc.workingAfter = 5 * time.Millisecond
+	svc.flushIdleTicks = 1
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_1",
+		GroupID:   "oc_1",
+		Text:      "hello",
+	}); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		return messenger.editCount() >= 1
+	})
+	time.Sleep(200 * time.Millisecond)
+	if got := messenger.editCount(); got != 1 {
+		t.Fatalf("editCount after backoff window check = %d, want 1", got)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		got := nonStatusMessages(messenger.all())
+		return len(got) == 1 && got[0] == "• first\n\n• second"
+	})
+	if got := messenger.editCount(); got < 2 {
+		t.Fatalf("editCount = %d, want retry after retry_after window", got)
 	}
 }
 
@@ -1182,7 +1434,7 @@ func TestSplitByRunesRespectsTelegramSafeChunkSize(t *testing.T) {
 func nonStatusMessages(texts []string) []string {
 	out := make([]string, 0, len(texts))
 	for _, text := range texts {
-		if strings.HasPrefix(text, "[working]") || strings.HasPrefix(text, "[imcodex]") {
+		if strings.HasPrefix(text, "[working]") {
 			continue
 		}
 		out = append(out, text)

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/magnaflowlabs/imcodex/internal/gateway"
@@ -22,10 +23,18 @@ type UpdateClient interface {
 }
 
 type Receiver struct {
-	client  UpdateClient
-	handler MessageHandler
-	logger  *slog.Logger
-	offset  int64
+	client   UpdateClient
+	handler  MessageHandler
+	logger   *slog.Logger
+	offset   int64
+	mu       sync.Mutex
+	pollStop context.CancelFunc
+	workers  map[string]chan queuedUpdate
+}
+
+type queuedUpdate struct {
+	update Update
+	done   chan error
 }
 
 func NewReceiver(client UpdateClient, handler MessageHandler, logger *slog.Logger) *Receiver {
@@ -36,6 +45,7 @@ func NewReceiver(client UpdateClient, handler MessageHandler, logger *slog.Logge
 		client:  client,
 		handler: handler,
 		logger:  logger,
+		workers: make(map[string]chan queuedUpdate),
 	}
 }
 
@@ -45,8 +55,20 @@ func (r *Receiver) Start(ctx context.Context) error {
 		return nil
 	}
 
+	go func() {
+		<-ctx.Done()
+		r.stopPoll()
+	}()
+
 	for {
-		updates, err := r.client.GetUpdates(ctx, r.offset, pollTimeoutSeconds)
+		if ctx.Err() != nil {
+			return nil
+		}
+		pollCtx, cancel := context.WithCancel(ctx)
+		r.setPollStop(cancel)
+		updates, err := r.client.GetUpdates(pollCtx, r.offset, pollTimeoutSeconds)
+		r.clearPollStop(cancel)
+		cancel()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -60,22 +82,116 @@ func (r *Receiver) Start(ctx context.Context) error {
 			continue
 		}
 
-		for _, update := range updates {
-			if update.UpdateID >= r.offset {
-				r.offset = update.UpdateID + 1
-			}
-			msg, ok, err := updateToIncomingMessage(update)
-			if err != nil {
-				r.logger.Warn("telegram update decode failed", "update_id", update.UpdateID, "err", err)
-				continue
-			}
-			if !ok {
-				continue
-			}
-			if err := r.handler.HandleMessage(ctx, msg); err != nil {
-				return err
-			}
+		if len(updates) == 0 {
+			continue
 		}
+		if err := r.processBatch(ctx, updates); err != nil {
+			return err
+		}
+	}
+}
+
+func (r *Receiver) processBatch(ctx context.Context, updates []Update) error {
+	if len(updates) == 0 {
+		return nil
+	}
+
+	done := make(chan error, len(updates))
+	nextOffset := r.offset
+	dispatched := 0
+	for _, update := range updates {
+		if update.UpdateID >= nextOffset {
+			nextOffset = update.UpdateID + 1
+		}
+		if err := r.dispatchUpdate(ctx, update, done); err != nil {
+			return err
+		}
+		dispatched++
+	}
+
+	for i := 0; i < dispatched; i++ {
+		if err := <-done; err != nil {
+			return err
+		}
+	}
+	r.offset = nextOffset
+	return nil
+}
+
+func (r *Receiver) dispatchUpdate(ctx context.Context, update Update, done chan error) error {
+	key := updateWorkerKey(update)
+	worker := r.workerForKey(ctx, key)
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case worker <- queuedUpdate{update: update, done: done}:
+		return nil
+	}
+}
+
+func (r *Receiver) workerForKey(ctx context.Context, key string) chan queuedUpdate {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	if worker, ok := r.workers[key]; ok {
+		return worker
+	}
+
+	worker := make(chan queuedUpdate, 32)
+	r.workers[key] = worker
+	go r.runWorker(ctx, key, worker)
+	return worker
+}
+
+func (r *Receiver) runWorker(ctx context.Context, key string, worker chan queuedUpdate) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case item := <-worker:
+			item.done <- r.handleUpdate(ctx, item.update)
+		}
+	}
+}
+
+func (r *Receiver) handleUpdate(ctx context.Context, update Update) error {
+	msg, ok, err := updateToIncomingMessage(update)
+	if err != nil {
+		r.logger.Warn("telegram update decode failed", "update_id", update.UpdateID, "err", err)
+		return nil
+	}
+	if !ok {
+		return nil
+	}
+	return r.handler.HandleMessage(ctx, msg)
+}
+
+func updateWorkerKey(update Update) string {
+	if update.Message != nil {
+		return strconv.FormatInt(update.Message.Chat.ID, 10)
+	}
+	return "update:" + strconv.FormatInt(update.UpdateID, 10)
+}
+
+func (r *Receiver) setPollStop(cancel context.CancelFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pollStop = cancel
+}
+
+func (r *Receiver) clearPollStop(cancel context.CancelFunc) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.pollStop = nil
+}
+
+func (r *Receiver) stopPoll() {
+	r.mu.Lock()
+	cancel := r.pollStop
+	r.pollStop = nil
+	r.mu.Unlock()
+	if cancel != nil {
+		cancel()
 	}
 }
 

@@ -211,7 +211,7 @@ If you use `./imcodex.yaml` or `~/.imcodex.yaml`, `-config` is optional:
 Expected startup log:
 
 ```text
-imcodex started: config=/srv/imcodex/imcodex.yaml platform=lark groups=1 jobs=1 base=https://open.larksuite.com
+imcodex 1.1.0 started: config=/srv/imcodex/imcodex.yaml platform=lark groups=1 jobs=1 base=https://open.larksuite.com
 ```
 
 ## Runtime Behavior
@@ -222,12 +222,13 @@ imcodex started: config=/srv/imcodex/imcodex.yaml platform=lark groups=1 jobs=1 
 | Multi-line input | Preserved as one pasted input |
 | Slash commands | Forwarded as-is, for example `/new` or `/compact` |
 | Images / files | Downloaded into `cwd/.imcodex/inbox/`, then forwarded as a short text prompt with the saved path |
-| Telegram live output | Sends one early working status, then edits an active message after a short idle debounce; long replies roll over into a small number of continuation messages |
+| Telegram live output | Sends periodic typing actions while the first visible reply is pending, posts one early working status, then edits an active message after a short idle debounce |
+| Telegram edit rate limit | If Telegram returns `429` on `editMessageText`, buffered text is preserved and retried after `retry_after` backoff |
 | New message while main session is busy | Interrupts the current run and keeps only the newest pending message by default |
 | Job execution | Posts only the final result, not live incremental output |
 | Restart | Reuses existing `tmux` sessions when they still exist |
 
-Current Telegram defaults are internal constants: `working` after about `1s`, body flush after about `4s`, and rollover near `2800` runes. See [docs/telegram-output-buffering.md](docs/telegram-output-buffering.md).
+Current Telegram defaults are internal constants: `working` after about `1s`, partial body refresh at most every `5s` while Codex is still busy, idle body flush after about `4s`, and rollover near `2800` runes. See [docs/telegram-output-buffering.md](docs/telegram-output-buffering.md).
 
 ## Inspect Sessions
 

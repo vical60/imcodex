@@ -52,7 +52,8 @@ func main() {
 	}
 
 	log.Printf(
-		"imcodex started: config=%s platform=%s groups=%d jobs=%d base=%s",
+		"imcodex %s started: config=%s platform=%s groups=%d jobs=%d base=%s",
+		appVersion,
 		cfg.path,
 		cfg.platform,
 		router.GroupCount(),

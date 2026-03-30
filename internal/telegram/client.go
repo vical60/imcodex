@@ -12,6 +12,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/magnaflowlabs/imcodex/internal/gateway"
@@ -22,13 +23,21 @@ const defaultBaseURL = "https://api.telegram.org"
 const (
 	defaultRequestTimeout = 75 * time.Second
 	longPollTimeoutBuffer = 15 * time.Second
+	defaultThrottleEvery  = 40 * time.Millisecond
+	defaultActionBackoff  = time.Minute
 	redactedToken         = "[REDACTED]"
 )
 
 type Client struct {
-	baseURL    string
-	botToken   string
-	httpClient *http.Client
+	baseURL         string
+	botToken        string
+	httpClient      *http.Client
+	throttleEvery   time.Duration
+	actionBackoff   time.Duration
+	throttleMu      sync.Mutex
+	lastRequestAt   time.Time
+	actionStateMu   sync.Mutex
+	actionBackoffTo time.Time
 }
 
 type Update struct {
@@ -82,9 +91,11 @@ func NewClient(botToken string, baseURL string) *Client {
 		baseURL = defaultBaseURL
 	}
 	return &Client{
-		baseURL:    strings.TrimRight(baseURL, "/"),
-		botToken:   strings.TrimSpace(botToken),
-		httpClient: &http.Client{Timeout: defaultRequestTimeout},
+		baseURL:       strings.TrimRight(baseURL, "/"),
+		botToken:      strings.TrimSpace(botToken),
+		httpClient:    &http.Client{Timeout: defaultRequestTimeout},
+		throttleEvery: defaultThrottleEvery,
+		actionBackoff: defaultActionBackoff,
 	}
 }
 
@@ -119,6 +130,27 @@ func (c *Client) EditTextInChat(ctx context.Context, groupID string, messageID s
 		"text":                     text,
 		"disable_web_page_preview": true,
 	}, nil)
+}
+
+func (c *Client) SendChatAction(ctx context.Context, groupID string, action string) error {
+	if c == nil {
+		return nil
+	}
+	if c.chatActionSuppressed(time.Now()) {
+		return nil
+	}
+	err := c.call(ctx, "sendChatAction", map[string]any{
+		"chat_id": strings.TrimSpace(groupID),
+		"action":  strings.TrimSpace(action),
+	}, nil)
+	if err == nil {
+		c.clearChatActionBackoff()
+		return nil
+	}
+	if isTelegramUnauthorized(err) {
+		c.setChatActionBackoff(time.Now())
+	}
+	return err
 }
 
 func (c *Client) DownloadMessageResource(ctx context.Context, _ string, _ string, resourceKey string) (gateway.DownloadedResource, error) {
@@ -188,6 +220,9 @@ func (c *Client) call(ctx context.Context, method string, payload any, out any) 
 	if strings.TrimSpace(c.botToken) == "" {
 		return fmt.Errorf("telegram bot token is empty")
 	}
+	if err := c.waitForThrottle(ctx); err != nil {
+		return err
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return fmt.Errorf("marshal telegram request: %w", err)
@@ -242,4 +277,64 @@ func (c *Client) redact(text string) string {
 		return text
 	}
 	return strings.ReplaceAll(text, token, redactedToken)
+}
+
+func (c *Client) waitForThrottle(ctx context.Context) error {
+	if c == nil || c.throttleEvery <= 0 {
+		return nil
+	}
+	c.throttleMu.Lock()
+	defer c.throttleMu.Unlock()
+
+	now := time.Now()
+	next := c.lastRequestAt.Add(c.throttleEvery)
+	if c.lastRequestAt.IsZero() || !next.After(now) {
+		c.lastRequestAt = now
+		return nil
+	}
+
+	timer := time.NewTimer(next.Sub(now))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		c.lastRequestAt = time.Now()
+		return nil
+	}
+}
+
+func (c *Client) chatActionSuppressed(now time.Time) bool {
+	if c == nil {
+		return true
+	}
+	c.actionStateMu.Lock()
+	defer c.actionStateMu.Unlock()
+	return !c.actionBackoffTo.IsZero() && c.actionBackoffTo.After(now)
+}
+
+func (c *Client) setChatActionBackoff(now time.Time) {
+	if c == nil || c.actionBackoff <= 0 {
+		return
+	}
+	c.actionStateMu.Lock()
+	defer c.actionStateMu.Unlock()
+	c.actionBackoffTo = now.Add(c.actionBackoff)
+}
+
+func (c *Client) clearChatActionBackoff() {
+	if c == nil {
+		return
+	}
+	c.actionStateMu.Lock()
+	defer c.actionStateMu.Unlock()
+	c.actionBackoffTo = time.Time{}
+}
+
+func isTelegramUnauthorized(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(err.Error())
+	return strings.Contains(text, "code=401") || strings.Contains(text, "http=401")
 }

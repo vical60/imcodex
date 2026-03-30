@@ -8,6 +8,7 @@ import (
 	"mime"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,14 +18,15 @@ import (
 )
 
 const (
-	maxMessageRunes       = 3000
-	queueSize             = 64
-	recentMessageIDLimit  = 256
-	maxAttachmentRetries  = 1
-	defaultFlushIdleTicks = 8
-	defaultWorkingAfter   = time.Second
-	defaultEditRolloverAt = 2800
-	workingStatusText     = "[working] Codex is processing."
+	maxMessageRunes        = 3000
+	queueSize              = 64
+	recentMessageIDLimit   = 256
+	defaultFlushIdleTicks  = 8
+	defaultWorkingAfter    = time.Second
+	defaultChatActionEvery = 4 * time.Second
+	defaultBusyFlushAfter  = 5 * time.Second
+	defaultEditRolloverAt  = 2800
+	workingStatusText      = "[working] Codex is processing."
 )
 
 type IncomingMessage struct {
@@ -66,6 +68,10 @@ type EditableMessenger interface {
 	EditTextInChat(ctx context.Context, groupID string, messageID string, text string) error
 }
 
+type ActionMessenger interface {
+	SendChatAction(ctx context.Context, groupID string, action string) error
+}
+
 type Console interface {
 	EnsureSession(ctx context.Context, spec tmuxctl.SessionSpec) (bool, error)
 	SendText(ctx context.Context, session string, text string) error
@@ -90,6 +96,8 @@ type Service struct {
 	history             int
 	flushIdleTicks      int
 	workingAfter        time.Duration
+	chatActionEvery     time.Duration
+	busyFlushAfter      time.Duration
 	editRolloverAt      int
 	interruptForceAfter time.Duration
 
@@ -101,10 +109,8 @@ type Service struct {
 }
 
 type activeRequest struct {
-	messageID      string
-	input          string
-	retryCount     int
-	hasAttachments bool
+	messageID string
+	input     string
 }
 
 type groupRuntime struct {
@@ -119,10 +125,13 @@ type groupRuntime struct {
 	lastBusy           bool
 	idleTicks          int
 	outputBuffer       string
+	outputBufferedAt   time.Time
 	outputText         string
 	outputMessages     []trackedMessage
+	editBackoffUntil   time.Time
 	busySince          time.Time
 	workingSent        bool
+	lastActionAt       time.Time
 	interruptSentAt    time.Time
 	forceInterruptSent bool
 }
@@ -151,6 +160,8 @@ func NewService(ctx context.Context, opts Options, messenger Messenger, console 
 		history:             2000,
 		flushIdleTicks:      defaultFlushIdleTicks,
 		workingAfter:        defaultWorkingAfter,
+		chatActionEvery:     defaultChatActionEvery,
+		busyFlushAfter:      defaultBusyFlushAfter,
 		editRolloverAt:      defaultEditRolloverAt,
 		interruptForceAfter: time.Second,
 	}
@@ -255,7 +266,7 @@ func (s *Service) runGroup(rt *groupRuntime) {
 			wasReady := rt.sessionReady
 			s.enqueuePending(rt, msg)
 			if err := s.ensureSession(rt); err != nil {
-				s.sendBestEffort(rt.opts.GroupID, fmt.Sprintf("[imcodex] Failed to start session: %v", err))
+				s.sendBestEffort(rt.opts.GroupID, fmt.Sprintf("Failed to start Codex session: %v", err))
 				continue
 			}
 			if !wasReady {
@@ -294,7 +305,7 @@ func (s *Service) ensureSession(rt *groupRuntime) error {
 		return nil
 	}
 
-	created, err := s.console.EnsureSession(s.ctx, tmuxctl.SessionSpec{
+	_, err := s.console.EnsureSession(s.ctx, tmuxctl.SessionSpec{
 		SessionName:                 rt.session,
 		CWD:                         rt.opts.CWD,
 		StartupWait:                 s.startWait,
@@ -313,18 +324,17 @@ func (s *Service) ensureSession(rt *groupRuntime) error {
 	rt.baseText = ""
 	rt.lastBusy = tmuxctl.IsBusy(snapshot)
 	rt.idleTicks = 0
-	rt.outputBuffer = ""
+	rt.clearOutputBuffer()
 	rt.outputText = ""
 	rt.outputMessages = nil
+	rt.editBackoffUntil = time.Time{}
 	rt.busySince = time.Time{}
 	rt.workingSent = false
+	rt.lastActionAt = time.Time{}
 	rt.interruptSentAt = time.Time{}
 	rt.forceInterruptSent = false
 	rt.sessionReady = true
 
-	if created {
-		s.sendBestEffort(rt.opts.GroupID, fmt.Sprintf("[imcodex] Connected to `%s`, tmux=`%s`.", filepath.Base(rt.opts.CWD), rt.session))
-	}
 	return nil
 }
 
@@ -338,7 +348,7 @@ func (s *Service) dispatchNext(rt *groupRuntime) {
 	text, err := s.materializeInput(msg)
 	if err != nil {
 		s.logger.Error("prepare message for codex failed", "group_id", rt.opts.GroupID, "message_id", msg.MessageID, "err", err)
-		s.sendBestEffort(rt.opts.GroupID, fmt.Sprintf("[imcodex] Failed to prepare message for Codex: %v", err))
+		s.sendBestEffort(rt.opts.GroupID, fmt.Sprintf("Failed to prepare request for Codex: %v", err))
 		if !rt.lastBusy && len(rt.pending) > 0 {
 			s.dispatchNext(rt)
 		}
@@ -346,12 +356,11 @@ func (s *Service) dispatchNext(rt *groupRuntime) {
 	}
 
 	if err := s.dispatchPrepared(rt, &activeRequest{
-		messageID:      msg.MessageID,
-		input:          text,
-		hasAttachments: len(msg.Attachments) > 0,
+		messageID: msg.MessageID,
+		input:     text,
 	}); err != nil {
 		s.logger.Error("send text to codex failed", "group_id", rt.opts.GroupID, "err", err)
-		s.sendBestEffort(rt.opts.GroupID, fmt.Sprintf("[imcodex] Failed to send to Codex: %v", err))
+		s.sendBestEffort(rt.opts.GroupID, fmt.Sprintf("Failed to send to Codex: %v", err))
 		rt.pending = nil
 		s.dropQueued(rt)
 		rt.sessionReady = false
@@ -359,11 +368,13 @@ func (s *Service) dispatchNext(rt *groupRuntime) {
 		rt.lastBusy = false
 		rt.idleTicks = 0
 		rt.lastText = ""
-		rt.outputBuffer = ""
+		rt.clearOutputBuffer()
 		rt.outputText = ""
 		rt.outputMessages = nil
+		rt.editBackoffUntil = time.Time{}
 		rt.busySince = time.Time{}
 		rt.workingSent = false
+		rt.lastActionAt = time.Time{}
 		rt.interruptSentAt = time.Time{}
 		rt.forceInterruptSent = false
 		rt.active = nil
@@ -383,10 +394,12 @@ func (s *Service) dispatchPrepared(rt *groupRuntime, req *activeRequest) error {
 	rt.baseText = baseline
 	rt.lastBusy = true
 	rt.idleTicks = 0
-	rt.outputBuffer = ""
+	rt.clearOutputBuffer()
 	rt.outputText = ""
+	rt.editBackoffUntil = time.Time{}
 	rt.busySince = time.Now()
 	rt.workingSent = false
+	rt.lastActionAt = time.Time{}
 	rt.interruptSentAt = time.Time{}
 	rt.forceInterruptSent = false
 	rt.active = req
@@ -418,11 +431,13 @@ func (s *Service) poll(rt *groupRuntime) {
 		rt.lastBusy = false
 		rt.idleTicks = 0
 		rt.lastText = ""
-		rt.outputBuffer = ""
+		rt.clearOutputBuffer()
 		rt.outputText = ""
 		rt.outputMessages = nil
+		rt.editBackoffUntil = time.Time{}
 		rt.busySince = time.Time{}
 		rt.workingSent = false
+		rt.lastActionAt = time.Time{}
 		rt.active = nil
 		return
 	}
@@ -435,6 +450,9 @@ func (s *Service) poll(rt *groupRuntime) {
 
 	if busy {
 		rt.idleTicks = 0
+		if rt.outputText == "" {
+			s.sendChatAction(rt)
+		}
 		if s.opts.InterruptOnNewMessage && len(rt.pending) > 0 && rt.interruptSentAt.IsZero() {
 			s.requestInterrupt(rt)
 		}
@@ -453,16 +471,11 @@ func (s *Service) poll(rt *groupRuntime) {
 		rt.idleTicks++
 	}
 
-	if delta != "" {
-		rt.outputBuffer += delta
-	}
+	rt.appendOutputBuffer(delta, time.Now())
 	if reset {
-		rt.outputBuffer = ""
+		s.resetBufferedOutput(rt, currText)
 	}
-	retryCurrent := !busy && len(rt.pending) == 0 && shouldRetryAttachmentRequest(rt.active, currText)
-	if retryCurrent {
-		rt.outputBuffer = ""
-	} else if shouldFlush(rt.outputBuffer, busy, rt.idleTicks, s.flushIdleTicks) {
+	if shouldFlush(rt.outputBuffer, rt.outputBufferedAt, busy, rt.idleTicks, s.flushIdleTicks, s.busyFlushAfter, time.Now()) {
 		s.flushOutputBuffer(rt)
 	}
 
@@ -471,34 +484,10 @@ func (s *Service) poll(rt *groupRuntime) {
 	if !busy {
 		rt.busySince = time.Time{}
 		rt.workingSent = false
+		rt.lastActionAt = time.Time{}
 		rt.interruptSentAt = time.Time{}
 		rt.forceInterruptSent = false
-		if !retryCurrent {
-			rt.active = nil
-		}
-	}
-
-	if retryCurrent {
-		if err := s.retryActiveRequest(rt); err != nil {
-			s.logger.Error("retry attachment request failed", "group_id", rt.opts.GroupID, "session", rt.session, "message_id", rt.activeMessageID(), "err", err)
-			s.sendBestEffort(rt.opts.GroupID, fmt.Sprintf("[imcodex] Failed to send to Codex: %v", err))
-			rt.pending = nil
-			s.dropQueued(rt)
-			rt.sessionReady = false
-			rt.baseText = ""
-			rt.lastBusy = false
-			rt.idleTicks = 0
-			rt.lastText = ""
-			rt.outputBuffer = ""
-			rt.outputText = ""
-			rt.outputMessages = nil
-			rt.busySince = time.Time{}
-			rt.workingSent = false
-			rt.interruptSentAt = time.Time{}
-			rt.forceInterruptSent = false
-			rt.active = nil
-		}
-		return
+		rt.active = nil
 	}
 
 	if !busy && len(rt.pending) > 0 {
@@ -507,43 +496,37 @@ func (s *Service) poll(rt *groupRuntime) {
 	}
 }
 
-func (s *Service) retryActiveRequest(rt *groupRuntime) error {
-	if rt.active == nil {
-		return errors.New("active request is nil")
-	}
-	retry := *rt.active
-	retry.retryCount++
-	s.logger.Warn("codex stream disconnected before completion; retrying attachment request", "group_id", rt.opts.GroupID, "session", rt.session, "message_id", retry.messageID, "retry_count", retry.retryCount)
-	return s.dispatchPrepared(rt, &retry)
-}
-
-func shouldFlush(buffer string, busy bool, idleTicks int, flushIdleTicks int) bool {
+func shouldFlush(buffer string, bufferedAt time.Time, busy bool, idleTicks int, flushIdleTicks int, busyFlushAfter time.Duration, now time.Time) bool {
 	if strings.TrimSpace(buffer) == "" {
 		return false
+	}
+	if busy {
+		return !bufferedAt.IsZero() && busyFlushAfter > 0 && now.Sub(bufferedAt) >= busyFlushAfter
 	}
 	if flushIdleTicks <= 0 {
 		flushIdleTicks = 1
 	}
-	return !busy && idleTicks >= flushIdleTicks
+	return idleTicks >= flushIdleTicks
 }
 
-func shouldRetryAttachmentRequest(req *activeRequest, output string) bool {
-	if req == nil || !req.hasAttachments || req.retryCount >= maxAttachmentRetries {
-		return false
+func (s *Service) resetBufferedOutput(rt *groupRuntime, currText string) {
+	if rt == nil {
+		return
 	}
-	return looksLikeTransientStreamDisconnect(output)
-}
+	currText = strings.Trim(currText, "\n")
+	if strings.TrimSpace(currText) == "" {
+		rt.clearOutputBuffer()
+		rt.outputText = ""
+		return
+	}
 
-func looksLikeTransientStreamDisconnect(output string) bool {
-	output = strings.TrimSpace(output)
-	if output == "" {
-		return false
+	delta, reset := tmuxctl.DiffText(rt.outputText, currText)
+	if reset {
+		rt.outputText = ""
+		rt.replaceOutputBuffer(currText, time.Now())
+		return
 	}
-	lower := strings.ToLower(output)
-	if !strings.Contains(lower, "stream disconnected before completion") && !strings.Contains(lower, "before response.completed") {
-		return false
-	}
-	return utf8.RuneCountInString(output) <= 240
+	rt.replaceOutputBuffer(delta, time.Now())
 }
 
 func (s *Service) enqueuePending(rt *groupRuntime, msg IncomingMessage) {
@@ -767,11 +750,16 @@ func (s *Service) editableMessenger() EditableMessenger {
 	return editable
 }
 
+func (s *Service) actionMessenger() ActionMessenger {
+	actioner, _ := s.messenger.(ActionMessenger)
+	return actioner
+}
+
 func (s *Service) prepareOutputForDispatch(rt *groupRuntime) {
 	if rt == nil {
 		return
 	}
-	rt.outputBuffer = ""
+	rt.clearOutputBuffer()
 	rt.outputText = ""
 	if len(rt.outputMessages) == 1 && rt.outputMessages[0].text == workingStatusText {
 		return
@@ -803,12 +791,39 @@ func (s *Service) sendWorkingStatus(rt *groupRuntime) {
 	}}
 }
 
+func (s *Service) sendChatAction(rt *groupRuntime) {
+	if rt == nil || s.chatActionEvery <= 0 {
+		return
+	}
+	actioner := s.actionMessenger()
+	if actioner == nil {
+		return
+	}
+	now := time.Now()
+	if !rt.lastActionAt.IsZero() && now.Sub(rt.lastActionAt) < s.chatActionEvery {
+		return
+	}
+	if err := actioner.SendChatAction(context.Background(), rt.opts.GroupID, "typing"); err != nil {
+		s.logger.Warn("send chat action failed", "group_id", rt.opts.GroupID, "err", err)
+		return
+	}
+	rt.lastActionAt = now
+}
+
 func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 	if rt == nil {
 		return
 	}
+	now := time.Now()
+	if !rt.editBackoffUntil.IsZero() {
+		if rt.editBackoffUntil.After(now) {
+			return
+		}
+		rt.editBackoffUntil = time.Time{}
+	}
 	raw := rt.outputBuffer
-	rt.outputBuffer = ""
+	bufferedAt := rt.outputBufferedAt
+	rt.clearOutputBuffer()
 	if strings.TrimSpace(raw) == "" {
 		return
 	}
@@ -829,10 +844,108 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 	}
 	if err := s.syncEditableOutput(rt, editable, desiredText); err != nil {
 		rt.outputBuffer = raw + rt.outputBuffer
+		if rt.outputBufferedAt.IsZero() {
+			rt.outputBufferedAt = bufferedAt
+		}
+		if retryAfter := retryAfterFromRateLimitError(err); retryAfter > 0 {
+			rt.editBackoffUntil = time.Now().Add(retryAfter)
+			s.logger.Warn(
+				"sync editable output rate-limited",
+				"group_id",
+				rt.opts.GroupID,
+				"retry_after",
+				retryAfter.String(),
+				"retry_at",
+				rt.editBackoffUntil,
+				"err",
+				err,
+			)
+			return
+		}
 		s.logger.Error("sync editable output failed", "group_id", rt.opts.GroupID, "err", err)
 		return
 	}
 	rt.outputText = candidateText
+}
+
+func retryAfterFromRateLimitError(err error) time.Duration {
+	if err == nil {
+		return 0
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	if text == "" || (!strings.Contains(text, "http=429") && !strings.Contains(text, "code=429")) {
+		return 0
+	}
+	if i := strings.Index(text, "retry_after="); i >= 0 {
+		raw := text[i+len("retry_after="):]
+		n := parseLeadingInt(raw)
+		if n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	if i := strings.Index(text, "retry after "); i >= 0 {
+		raw := text[i+len("retry after "):]
+		n := parseLeadingInt(raw)
+		if n > 0 {
+			return time.Duration(n) * time.Second
+		}
+	}
+	return 2 * time.Second
+}
+
+func parseLeadingInt(text string) int {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return 0
+	}
+	end := 0
+	for end < len(text) {
+		ch := text[end]
+		if ch < '0' || ch > '9' {
+			break
+		}
+		end++
+	}
+	if end == 0 {
+		return 0
+	}
+	n, err := strconv.Atoi(text[:end])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
+func (rt *groupRuntime) appendOutputBuffer(delta string, now time.Time) {
+	if rt == nil || delta == "" {
+		return
+	}
+	if rt.outputBuffer == "" && rt.outputBufferedAt.IsZero() {
+		rt.outputBufferedAt = now
+	}
+	rt.outputBuffer += delta
+}
+
+func (rt *groupRuntime) replaceOutputBuffer(text string, now time.Time) {
+	if rt == nil {
+		return
+	}
+	if text == "" {
+		rt.clearOutputBuffer()
+		return
+	}
+	rt.outputBuffer = text
+	if rt.outputBufferedAt.IsZero() {
+		rt.outputBufferedAt = now
+	}
+}
+
+func (rt *groupRuntime) clearOutputBuffer() {
+	if rt == nil {
+		return
+	}
+	rt.outputBuffer = ""
+	rt.outputBufferedAt = time.Time{}
 }
 
 func (s *Service) syncEditableOutput(rt *groupRuntime, editable EditableMessenger, desiredText string) error {

@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -132,6 +133,60 @@ func TestClientRedactsTokenFromErrors(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), redactedToken) {
 		t.Fatalf("error = %v, want redacted token marker", err)
+	}
+}
+
+func TestClientThrottlesAPICalls(t *testing.T) {
+	t.Parallel()
+
+	var mu sync.Mutex
+	var callTimes []time.Time
+	client := NewClient("123:abc", "https://example.invalid")
+	client.throttleEvery = 25 * time.Millisecond
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		mu.Lock()
+		callTimes = append(callTimes, time.Now())
+		mu.Unlock()
+		return jsonResponse(r, `{"ok":true,"result":{"message_id":1}}`), nil
+	})}
+
+	if err := client.SendTextToChat(context.Background(), "-1001", "first"); err != nil {
+		t.Fatalf("SendTextToChat(first) error = %v", err)
+	}
+	if err := client.SendTextToChat(context.Background(), "-1001", "second"); err != nil {
+		t.Fatalf("SendTextToChat(second) error = %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(callTimes) != 2 {
+		t.Fatalf("len(callTimes) = %d, want 2", len(callTimes))
+	}
+	if gap := callTimes[1].Sub(callTimes[0]); gap < 20*time.Millisecond {
+		t.Fatalf("gap = %v, want >= 20ms", gap)
+	}
+}
+
+func TestClientSendChatActionBacksOffAfterUnauthorized(t *testing.T) {
+	t.Parallel()
+
+	var calls int
+	client := NewClient("123:abc", "https://example.invalid")
+	client.actionBackoff = time.Hour
+	client.httpClient = &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		return jsonResponse(r, `{"ok":false,"error_code":401,"description":"unauthorized"}`), nil
+	})}
+
+	err := client.SendChatAction(context.Background(), "-1001", "typing")
+	if err == nil {
+		t.Fatal("SendChatAction(first) error = nil, want unauthorized error")
+	}
+	if err := client.SendChatAction(context.Background(), "-1001", "typing"); err != nil {
+		t.Fatalf("SendChatAction(second) error = %v, want suppressed by backoff", err)
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 due to action backoff", calls)
 	}
 }
 

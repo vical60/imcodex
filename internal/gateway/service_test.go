@@ -809,76 +809,6 @@ func TestServiceRefreshesBaselineBeforeDispatchingNewRequest(t *testing.T) {
 	}
 }
 
-func TestServiceCompletesWhenStatusSlotStaysEmpty(t *testing.T) {
-	t.Parallel()
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	console := &fakeConsole{
-		captures: []string{
-			"• Working (1s • esc to interrupt)\n  gpt-5.4 xhigh · 100% left · /srv/demo\n› ",
-			"• final reply\n  gpt-5.4 xhigh · 100% left · /srv/demo\n› ",
-			"• final reply\n  gpt-5.4 xhigh · 100% left · /srv/demo\n› ",
-			"• final reply\n\n› ",
-			"• final reply\n\n› ",
-		},
-	}
-	messenger := &fakeMessenger{}
-
-	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
-	svc.pollEvery = 5 * time.Millisecond
-	svc.history = 2000
-	svc.startWait = 0
-	svc.flushIdleTicks = 1
-	svc.completeAfter = time.Nanosecond
-
-	rt := &groupRuntime{
-		opts:         svc.opts,
-		session:      svc.opts.SessionName,
-		sessionReady: true,
-		lastText:     "",
-	}
-
-	if err := svc.dispatchPrepared(rt, &activeRequest{
-		messageID: "om_1",
-		input:     "hello",
-	}); err != nil {
-		t.Fatalf("dispatchPrepared() error = %v", err)
-	}
-
-	svc.poll(rt) // busy marker on
-	if !rt.lastBusy {
-		t.Fatal("lastBusy = false after busy marker snapshot, want true")
-	}
-
-	svc.poll(rt) // marker gone but status slot still has text
-	if !rt.lastBusy {
-		t.Fatal("lastBusy = false while status slot not empty, want still busy")
-	}
-	if got := nonStatusMessages(messenger.all()); len(got) != 0 {
-		t.Fatalf("messages = %#v, want not flushed yet", got)
-	}
-
-	svc.poll(rt) // unchanged, still status text
-	if !rt.lastBusy {
-		t.Fatal("lastBusy = false while status slot not empty, want still busy")
-	}
-
-	svc.poll(rt) // first empty-slot observation
-	if rt.lastBusy == false {
-		t.Fatal("lastBusy = false on first empty-slot poll, want one more confirmation poll")
-	}
-
-	svc.poll(rt) // empty slot stable -> completion confirmed -> flush
-	if rt.lastBusy {
-		t.Fatal("lastBusy = true after empty status slot stabilization, want false")
-	}
-	if got := nonStatusMessages(messenger.all()); len(got) != 1 || got[0] != "• final reply" {
-		t.Fatalf("messages = %#v, want final reply flushed on completion", got)
-	}
-}
-
 func TestSuppressPromptEchoPrefixRequiresFullPrefixMatch(t *testing.T) {
 	t.Parallel()
 
@@ -1426,7 +1356,7 @@ func TestServiceDetachedOutputRetriesChunkWithoutReplay(t *testing.T) {
 	}
 
 	original := strings.Repeat("x", maxMessageRunes+16)
-	rt.enqueueDetachedOutput(original)
+	rt.enqueueDetachedOutput(1, original)
 	if got, want := len(rt.detachedOutputs), 2; got != want {
 		t.Fatalf("len(detachedOutputs) = %d, want %d chunked detached queue", got, want)
 	}
@@ -1454,6 +1384,115 @@ func TestServiceDetachedOutputRetriesChunkWithoutReplay(t *testing.T) {
 	}
 	if got := final[0] + final[1]; got != original {
 		t.Fatalf("reassembled output = %q, want exact original text", got)
+	}
+}
+
+func TestServiceDetachedOutputSkipsCommittedCursor(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeMessenger{}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	rt := &groupRuntime{
+		opts: svc.opts,
+		runCursorCommitted: map[uint64]int{
+			2: 2,
+		},
+		detachedOutputs: []detachedOutput{
+			{runID: 2, cursor: 2, text: "dup", enqueuedAt: time.Now().Add(-time.Second)},
+			{runID: 2, cursor: 3, text: "new", enqueuedAt: time.Now().Add(-time.Second)},
+		},
+	}
+
+	svc.flushDetachedOutputs(rt)
+
+	got := messenger.all()
+	if len(got) != 1 || got[0] != "new" {
+		t.Fatalf("messages = %#v, want only non-committed cursor chunk", got)
+	}
+	if got, want := rt.runCursor(2), 3; got != want {
+		t.Fatalf("runCursor(2) = %d, want %d", got, want)
+	}
+	if len(rt.detachedOutputs) != 0 {
+		t.Fatalf("len(detachedOutputs) = %d, want 0", len(rt.detachedOutputs))
+	}
+}
+
+func TestServiceOutputWatchdogDetachesBufferedTailWhenEditBackoffBlocks(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeEditableMessenger{}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	svc.outputWatchdogAfter = 10 * time.Millisecond
+
+	rt := &groupRuntime{
+		opts:               svc.opts,
+		runID:              7,
+		nextRunID:          7,
+		runCursorCommitted: map[uint64]int{7: 1},
+		outputText:         "• old",
+		outputBuffer:       "\n\n• tail",
+		outputBufferedAt:   time.Now().Add(-time.Second),
+		editBackoffUntil:   time.Now().Add(time.Minute),
+		outputMessages: []trackedMessage{
+			{messageID: "1", text: "• old"},
+		},
+	}
+
+	svc.applyOutputWatchdog(rt, time.Now())
+
+	got := nonStatusMessages(messenger.all())
+	if len(got) != 1 || got[0] != "• tail" {
+		t.Fatalf("messages = %#v, want detached tail delivered immediately", got)
+	}
+	if rt.hasBufferedOutput() {
+		t.Fatalf("outputBuffer = %q, want emptied by watchdog drain", rt.outputBuffer)
+	}
+	if len(rt.detachedOutputs) != 0 {
+		t.Fatalf("len(detachedOutputs) = %d, want 0 after watchdog flush", len(rt.detachedOutputs))
+	}
+	if got, want := rt.runCursor(7), 2; got != want {
+		t.Fatalf("runCursor(7) = %d, want %d", got, want)
+	}
+}
+
+func TestServiceDispatchNextDrainsBufferedTailBeforeRunSwitchEvenDuringEditBackoff(t *testing.T) {
+	t.Parallel()
+
+	console := &fakeConsole{captures: []string{""}}
+	messenger := &fakeEditableMessenger{}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	rt := &groupRuntime{
+		opts:               svc.opts,
+		session:            svc.opts.SessionName,
+		sessionReady:       true,
+		runID:              3,
+		nextRunID:          3,
+		runCursorCommitted: map[uint64]int{3: 1},
+		outputText:         "• first",
+		outputBuffer:       "\n\n• second tail",
+		outputBufferedAt:   time.Now().Add(-time.Second),
+		editBackoffUntil:   time.Now().Add(time.Minute),
+		pending: []IncomingMessage{
+			{MessageID: "om_2", GroupID: "oc_1", Text: "next"},
+		},
+	}
+
+	svc.dispatchNext(rt)
+	svc.flushDetachedOutputs(rt)
+
+	sendTexts := console.allSendTexts()
+	if len(sendTexts) != 1 || sendTexts[0] != "next" {
+		t.Fatalf("sendTexts = %#v, want next prompt dispatched", sendTexts)
+	}
+	got := nonStatusMessages(messenger.all())
+	if len(got) != 1 || got[0] != "• second tail" {
+		t.Fatalf("messages = %#v, want previous run tail detached and delivered once", got)
+	}
+	if rt.runID != 4 {
+		t.Fatalf("runID = %d, want switched to new run 4", rt.runID)
+	}
+	if got, want := rt.runCursor(3), 2; got != want {
+		t.Fatalf("runCursor(3) = %d, want %d after detached tail delivery", got, want)
 	}
 }
 

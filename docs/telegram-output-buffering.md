@@ -26,9 +26,12 @@
 | Flush trigger | Flush body after idle debounce, or sooner if buffered body text has been hidden for too long during a busy run |
 | Request boundary | Refresh the tmux output baseline immediately before dispatching a new prompt |
 | Before next user message dispatch | Try flush first; if edit path is blocked (backoff/edit-invalid), detach unsent tail to send queue and dispatch next prompt immediately |
+| Delivery identity | Track each Codex answer with `run_id` and monotonic `cursor`; advance cursor only after Telegram send/edit success |
+| Outbound execution model | Use one per-group event loop to serialize all Telegram send/edit/retry operations |
 | Capture/session recovery | Retain buffered body text across transient tmux capture/session failures and retry flush after reconnect |
 | Telegram length limit | When the active message approaches a soft limit, roll over to a new Telegram message |
 | Telegram API 429 | Respect `retry_after`; keep buffered body text and retry edit after backoff |
+| Watchdog | Force drain if buffered output or detached queue stays pending too long |
 
 ## Target Behavior
 
@@ -42,6 +45,7 @@
 | Active message nears Telegram limit | Finalize the current message and create a new continuation message, then continue editing the new one |
 | New user prompt arrives while previous reply text is buffered | Flush buffered text first, then dispatch the new prompt |
 | Edit path stays blocked while next prompt arrives | New prompt still dispatches immediately; unsent tail is sent asynchronously from detached queue |
+| A send/edit operation succeeds | Commit `(run_id, cursor)` so already-committed chunks are not replayed |
 
 ## Proposed Timing
 
@@ -49,8 +53,10 @@
 | --- | --- | --- |
 | `working_after` | `1s` | Fast feedback so the group knows the bot is alive |
 | `busy_flush_after` | `5s` | Maximum time buffered body text can stay hidden while Codex is still busy |
-| `body_flush_after` | `4s` | Long enough to absorb short pauses in Codex output |
+| Idle flush debounce | `8` polls (`~4s` at 500ms polling) | Long enough to absorb short pauses in Codex output |
 | `edit_rollover_at` | `2800` runes | Soft limit for Telegram message editing |
+| `output_watchdog_after` | `8s` | Maximum time buffered output can remain pending before forced drain/detach |
+| `detached_watchdog_after` | `15s` | Maximum age of detached queue head before forced retry |
 | Hard per-message limit | `3000` runes | Keep existing safe limit below Telegram's hard ceiling |
 | Poll interval | Keep current polling model | Effective flush delay should be derived from polling interval |
 
@@ -62,11 +68,13 @@
 | 2 | If Codex is still busy at `working_after`, send one `[working]` message and store its Telegram `message_id` |
 | 3 | While Codex is generating, append deltas to an internal reply buffer |
 | 4 | If Codex stays busy and buffered body text has been hidden for `busy_flush_after`, merge the latest buffered text into the active Telegram message with `editMessageText` |
-| 5 | On busy→idle transition, merge buffered text into the active Telegram message immediately (with `body_flush_after` as fallback for edge cases) |
+| 5 | On busy→idle transition, merge buffered text into the active Telegram message immediately (with idle tick debounce fallback for edge cases) |
 | 6 | If the merged text would exceed `edit_rollover_at`, keep the current message as-is, send a new continuation message, and continue edits there |
 | 7 | If a new user prompt arrives before the buffered text is flushed, flush first, then dispatch the new prompt |
 | 8 | Right before dispatch, refresh the tmux baseline so the next reply cannot replay stale tail output from the prior run |
 | 9 | If editable flush cannot complete at the boundary (for example retry-backoff or stale editable message), detach the unsent tail into a plain send queue and continue dispatch without blocking |
+| 10 | Detached chunks carry `(run_id, cursor)` and are retried in order; chunks with committed cursor are skipped to avoid replay loops |
+| 11 | If output buffer age exceeds `output_watchdog_after`, force drain; if still blocked, detach and continue |
 
 ## Rationale
 
@@ -93,7 +101,9 @@
 | --- | --- | --- | --- |
 | `working_after` | duration | `1s` | Delay before sending the first status message |
 | `busy_flush_after` | duration | `5s` | Maximum hidden-body delay while Codex is still generating |
-| `body_flush_after` | duration | `4s` | Idle window before flushing buffered reply text |
+| `flush_idle_ticks` | integer | `8` | Idle polls required before flushing buffered reply text |
+| `output_watchdog_after` | duration | `8s` | Force drain buffered output if no successful forward for too long |
+| `detached_watchdog_after` | duration | `15s` | Force retry detached queue head if it remains pending too long |
 | `edit_rollover_at` | integer | `2800` | Soft threshold for starting a new Telegram message |
 
 Current implementation uses internal constants for these values. YAML exposure is a follow-up.
@@ -110,9 +120,10 @@ Current implementation uses internal constants for these values. YAML exposure i
 | Reply fits within one message | The initial `working` message is edited into the final body message |
 | Reply exceeds Telegram safe size | Telegram shows a small number of continuation messages, each maintained with edit-in-place until rollover |
 | Telegram returns `429 Too Many Requests` during edit | Buffered body is retained and next edit attempt waits at least `retry_after` seconds |
+| Telegram path retries and reconnects under pressure | `(run_id, cursor)` remains monotonic and no committed chunk is replayed |
 | Tmux capture fails temporarily while body is buffered | Buffered body survives reconnect and is delivered before the next prompt dispatch |
 
 ## Follow-Ups
 
-1. Expose `working_after`, `busy_flush_after`, `body_flush_after`, and `edit_rollover_at` through YAML if runtime tuning is needed.
-2. Decide whether Lark / Feishu should keep the current send-only behavior or gain a similar edit model later.
+1. Expose `working_after`, `busy_flush_after`, `flush_idle_ticks`, watchdog parameters, and `edit_rollover_at` through YAML if runtime tuning is needed.
+2. Add a small telemetry panel/command for `(group_id, run_id, cursor, buffer_len, detached_len)` to simplify production debugging.

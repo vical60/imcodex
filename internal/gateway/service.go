@@ -18,17 +18,18 @@ import (
 )
 
 const (
-	maxMessageRunes        = 3000
-	queueSize              = 64
-	recentMessageIDLimit   = 256
-	maxDetachedSendRetries = 3
-	defaultFlushIdleTicks  = 8
-	defaultWorkingAfter    = time.Second
-	defaultChatActionEvery = 4 * time.Second
-	defaultBusyFlushAfter  = 5 * time.Second
-	defaultCompleteAfter   = 0 * time.Millisecond
-	defaultEditRolloverAt  = 2800
-	workingStatusText      = "[working] Codex is processing."
+	maxMessageRunes         = 3000
+	queueSize               = 64
+	recentMessageIDLimit    = 256
+	maxDetachedSendRetries  = 3
+	defaultFlushIdleTicks   = 8
+	defaultWorkingAfter     = time.Second
+	defaultChatActionEvery  = 4 * time.Second
+	defaultBusyFlushAfter   = 5 * time.Second
+	defaultOutputWatchdog   = 8 * time.Second
+	defaultDetachedWatchdog = 15 * time.Second
+	defaultEditRolloverAt   = 2800
+	workingStatusText       = "[working] Codex is processing."
 )
 
 type IncomingMessage struct {
@@ -87,22 +88,23 @@ type ResourceFetcher interface {
 }
 
 type Service struct {
-	ctx                 context.Context
-	opts                Options
-	messenger           Messenger
-	console             Console
-	resources           ResourceFetcher
-	logger              *slog.Logger
-	pollEvery           time.Duration
-	startWait           time.Duration
-	history             int
-	flushIdleTicks      int
-	workingAfter        time.Duration
-	chatActionEvery     time.Duration
-	busyFlushAfter      time.Duration
-	completeAfter       time.Duration
-	editRolloverAt      int
-	interruptForceAfter time.Duration
+	ctx                   context.Context
+	opts                  Options
+	messenger             Messenger
+	console               Console
+	resources             ResourceFetcher
+	logger                *slog.Logger
+	pollEvery             time.Duration
+	startWait             time.Duration
+	history               int
+	flushIdleTicks        int
+	workingAfter          time.Duration
+	chatActionEvery       time.Duration
+	busyFlushAfter        time.Duration
+	outputWatchdogAfter   time.Duration
+	detachedWatchdogAfter time.Duration
+	editRolloverAt        int
+	interruptForceAfter   time.Duration
 
 	mu      sync.Mutex
 	runtime *groupRuntime
@@ -125,8 +127,6 @@ type groupRuntime struct {
 	outputArmed          bool
 	promptEchoTail       string
 	promptEchoPending    bool
-	statusSlotEmptySince time.Time
-	lastProgressAt       time.Time
 	sessionReady         bool
 	lastText             string
 	baseText             string
@@ -136,7 +136,7 @@ type groupRuntime struct {
 	outputBufferedAt     time.Time
 	outputText           string
 	outputMessages       []trackedMessage
-	detachedOutputs      []string
+	detachedOutputs      []detachedOutput
 	detachedBackoffUntil time.Time
 	detachedRetryCount   int
 	editBackoffUntil     time.Time
@@ -145,11 +145,21 @@ type groupRuntime struct {
 	lastActionAt         time.Time
 	interruptSentAt      time.Time
 	forceInterruptSent   bool
+	runID                uint64
+	nextRunID            uint64
+	runCursorCommitted   map[uint64]int
 }
 
 type trackedMessage struct {
 	messageID string
 	text      string
+}
+
+type detachedOutput struct {
+	runID      uint64
+	cursor     int
+	text       string
+	enqueuedAt time.Time
 }
 
 func NewService(ctx context.Context, opts Options, messenger Messenger, console Console, resources ResourceFetcher, logger *slog.Logger) *Service {
@@ -160,22 +170,23 @@ func NewService(ctx context.Context, opts Options, messenger Messenger, console 
 		opts.SessionName = DefaultSessionName(opts.CWD)
 	}
 	return &Service{
-		ctx:                 ctx,
-		opts:                opts,
-		messenger:           messenger,
-		console:             console,
-		resources:           resources,
-		logger:              logger,
-		pollEvery:           500 * time.Millisecond,
-		startWait:           4 * time.Second,
-		history:             2000,
-		flushIdleTicks:      defaultFlushIdleTicks,
-		workingAfter:        defaultWorkingAfter,
-		chatActionEvery:     defaultChatActionEvery,
-		busyFlushAfter:      defaultBusyFlushAfter,
-		completeAfter:       defaultCompleteAfter,
-		editRolloverAt:      defaultEditRolloverAt,
-		interruptForceAfter: time.Second,
+		ctx:                   ctx,
+		opts:                  opts,
+		messenger:             messenger,
+		console:               console,
+		resources:             resources,
+		logger:                logger,
+		pollEvery:             500 * time.Millisecond,
+		startWait:             4 * time.Second,
+		history:               2000,
+		flushIdleTicks:        defaultFlushIdleTicks,
+		workingAfter:          defaultWorkingAfter,
+		chatActionEvery:       defaultChatActionEvery,
+		busyFlushAfter:        defaultBusyFlushAfter,
+		outputWatchdogAfter:   defaultOutputWatchdog,
+		detachedWatchdogAfter: defaultDetachedWatchdog,
+		editRolloverAt:        defaultEditRolloverAt,
+		interruptForceAfter:   time.Second,
 	}
 }
 
@@ -353,8 +364,6 @@ func (s *Service) ensureSession(rt *groupRuntime) error {
 		rt.outputMessages = nil
 		rt.promptEchoTail = ""
 		rt.promptEchoPending = false
-		rt.statusSlotEmptySince = time.Time{}
-		rt.lastProgressAt = time.Time{}
 		rt.detachedBackoffUntil = time.Time{}
 		rt.detachedRetryCount = 0
 		rt.editBackoffUntil = time.Time{}
@@ -408,8 +417,6 @@ func (s *Service) dispatchNext(rt *groupRuntime) {
 		rt.outputArmed = false
 		rt.promptEchoTail = ""
 		rt.promptEchoPending = false
-		rt.statusSlotEmptySince = time.Time{}
-		rt.lastProgressAt = time.Time{}
 		rt.clearOutputBuffer()
 		rt.outputText = ""
 		rt.outputMessages = nil
@@ -475,17 +482,26 @@ func (s *Service) dispatchPrepared(rt *groupRuntime, req *activeRequest) error {
 	rt.outputArmed = true
 	rt.promptEchoTail = normalizePromptEchoTail(req.input)
 	rt.promptEchoPending = rt.promptEchoTail != ""
-	rt.statusSlotEmptySince = time.Time{}
 	rt.clearOutputBuffer()
 	rt.outputText = ""
 	rt.editBackoffUntil = time.Time{}
 	rt.busySince = time.Now()
-	rt.lastProgressAt = rt.busySince
 	rt.workingSent = false
 	rt.lastActionAt = time.Time{}
 	rt.interruptSentAt = time.Time{}
 	rt.forceInterruptSent = false
 	rt.active = req
+	rt.nextRunID++
+	rt.runID = rt.nextRunID
+	rt.commitCursor(rt.runID, 0)
+	rt.pruneCommittedCursors(64)
+	s.logger.Info(
+		"codex run started",
+		"group_id", rt.opts.GroupID,
+		"run_id", rt.runID,
+		"message_id", req.messageID,
+		"cursor", rt.runCursor(rt.runID),
+	)
 	return nil
 }
 
@@ -517,8 +533,6 @@ func (s *Service) poll(rt *groupRuntime) {
 		rt.busySince = time.Time{}
 		rt.workingSent = false
 		rt.lastActionAt = time.Time{}
-		rt.statusSlotEmptySince = time.Time{}
-		rt.lastProgressAt = time.Time{}
 		rt.active = nil
 		return
 	}
@@ -536,26 +550,7 @@ func (s *Service) poll(rt *groupRuntime) {
 		}
 	}
 	delta, reset := tmuxctl.DiffText(prevText, currText)
-	progressed := strings.TrimSpace(delta) != "" || reset
-	if progressed {
-		rt.lastProgressAt = now
-	}
-
-	slotText, slotKnown := tmuxctl.InputStatusSlot(snapshot)
-	if slotKnown && strings.TrimSpace(slotText) == "" {
-		if rt.statusSlotEmptySince.IsZero() {
-			rt.statusSlotEmptySince = now
-		}
-	} else {
-		rt.statusSlotEmptySince = time.Time{}
-	}
-
 	busy := tmuxctl.IsBusy(snapshot)
-	if rt.active != nil && rt.lastBusy && !busy {
-		if !s.isCompletionConfirmed(rt, now, slotKnown) {
-			busy = true
-		}
-	}
 	becameIdle := rt.lastBusy && !busy
 
 	if busy {
@@ -593,9 +588,11 @@ func (s *Service) poll(rt *groupRuntime) {
 		} else if shouldFlush(rt.outputBuffer, rt.outputBufferedAt, busy, rt.idleTicks, s.flushIdleTicks, s.busyFlushAfter, now) {
 			s.flushOutputBuffer(rt)
 		}
+		s.applyOutputWatchdog(rt, now)
 	}
 
 	rt.lastText = currFullText
+	busyChanged := rt.lastBusy != busy
 	rt.lastBusy = busy
 	if !busy {
 		rt.busySince = time.Time{}
@@ -605,10 +602,46 @@ func (s *Service) poll(rt *groupRuntime) {
 		rt.forceInterruptSent = false
 		rt.active = nil
 	}
+	if busyChanged {
+		s.logger.Info(
+			"codex run state changed",
+			"group_id", rt.opts.GroupID,
+			"run_id", rt.runID,
+			"busy", busy,
+			"idle_ticks", rt.idleTicks,
+			"cursor", rt.runCursor(rt.runID),
+			"buffer_len", utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
+			"detached_len", len(rt.detachedOutputs),
+		)
+	}
 
 	if !busy && len(rt.pending) > 0 {
 		s.dispatchNext(rt)
 	}
+}
+
+func (s *Service) applyOutputWatchdog(rt *groupRuntime, now time.Time) {
+	if rt == nil || !rt.hasBufferedOutput() || s.outputWatchdogAfter <= 0 || rt.outputBufferedAt.IsZero() {
+		return
+	}
+	age := now.Sub(rt.outputBufferedAt)
+	if age < s.outputWatchdogAfter {
+		return
+	}
+	s.logger.Warn(
+		"output watchdog forcing drain",
+		"group_id", rt.opts.GroupID,
+		"run_id", rt.runID,
+		"cursor", rt.runCursor(rt.runID),
+		"age", age.String(),
+		"buffer_len", utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
+		"detached_len", len(rt.detachedOutputs),
+	)
+	s.flushOutputBuffer(rt)
+	if rt.hasBufferedOutput() {
+		s.detachBufferedOutput(rt)
+	}
+	s.flushDetachedOutputs(rt)
 }
 
 func shouldFlush(buffer string, bufferedAt time.Time, busy bool, idleTicks int, flushIdleTicks int, busyFlushAfter time.Duration, now time.Time) bool {
@@ -640,33 +673,6 @@ func shouldFlushOnSize(rt *groupRuntime, softLimit int, hardLimit int) bool {
 		return false
 	}
 	return utf8.RuneCountInString(candidate) >= limit
-}
-
-func (s *Service) isCompletionConfirmed(rt *groupRuntime, now time.Time, slotKnown bool) bool {
-	if rt == nil {
-		return true
-	}
-	if !slotKnown {
-		// Fallback to legacy marker-only behavior when prompt/status slot is not visible.
-		return true
-	}
-	wait := s.completeAfter
-	if wait <= 0 {
-		wait = s.pollEvery
-	}
-	if wait <= 0 {
-		wait = 500 * time.Millisecond
-	}
-	if rt.statusSlotEmptySince.IsZero() {
-		return false
-	}
-	if now.Sub(rt.statusSlotEmptySince) < wait {
-		return false
-	}
-	if rt.lastProgressAt.IsZero() {
-		return true
-	}
-	return now.Sub(rt.lastProgressAt) >= wait
 }
 
 func normalizePromptEchoTail(input string) string {
@@ -770,6 +776,48 @@ func (rt *groupRuntime) activeMessageID() string {
 		return ""
 	}
 	return rt.active.messageID
+}
+
+func (rt *groupRuntime) runCursor(runID uint64) int {
+	if rt == nil || runID == 0 || rt.runCursorCommitted == nil {
+		return 0
+	}
+	return rt.runCursorCommitted[runID]
+}
+
+func (rt *groupRuntime) nextCursor(runID uint64) int {
+	return rt.runCursor(runID) + 1
+}
+
+func (rt *groupRuntime) commitCursor(runID uint64, cursor int) {
+	if rt == nil || runID == 0 || cursor < 0 {
+		return
+	}
+	if rt.runCursorCommitted == nil {
+		rt.runCursorCommitted = make(map[uint64]int)
+	}
+	if cursor <= rt.runCursorCommitted[runID] {
+		return
+	}
+	rt.runCursorCommitted[runID] = cursor
+}
+
+func (rt *groupRuntime) pruneCommittedCursors(keep int) {
+	if rt == nil || keep <= 0 || rt.runCursorCommitted == nil {
+		return
+	}
+	if len(rt.runCursorCommitted) <= keep {
+		return
+	}
+	minRunID := uint64(1)
+	if rt.nextRunID > uint64(keep) {
+		minRunID = rt.nextRunID - uint64(keep) + 1
+	}
+	for runID := range rt.runCursorCommitted {
+		if runID < minRunID {
+			delete(rt.runCursorCommitted, runID)
+		}
+	}
 }
 
 func (s *Service) keepLatestPending(rt *groupRuntime) {
@@ -995,6 +1043,10 @@ func (s *Service) detachBufferedOutput(rt *groupRuntime) {
 	if rt == nil {
 		return
 	}
+	runID := rt.runID
+	if runID == 0 {
+		runID = rt.nextRunID
+	}
 	candidate := mergeBufferedOutput(rt.outputText, rt.outputBuffer)
 	unsent := candidate
 	if strings.HasPrefix(candidate, rt.outputText) {
@@ -1002,7 +1054,7 @@ func (s *Service) detachBufferedOutput(rt *groupRuntime) {
 	}
 	unsent = strings.Trim(unsent, "\n")
 	if strings.TrimSpace(unsent) != "" {
-		rt.enqueueDetachedOutput(unsent)
+		rt.enqueueDetachedOutput(runID, unsent)
 	}
 	rt.clearOutputBuffer()
 	rt.outputText = ""
@@ -1071,13 +1123,33 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 	if strings.TrimSpace(raw) == "" {
 		return
 	}
+	runID := rt.runID
+	if runID == 0 {
+		runID = rt.nextRunID
+	}
 	editable := s.editableMessenger()
 	if editable == nil {
 		text := strings.Trim(raw, "\n")
 		if strings.TrimSpace(text) == "" {
 			return
 		}
-		s.sendChunked(rt.opts.GroupID, text)
+		if err := s.sendChunkedStrict(rt.opts.GroupID, text); err != nil {
+			rt.outputBuffer = raw + rt.outputBuffer
+			if rt.outputBufferedAt.IsZero() {
+				rt.outputBufferedAt = bufferedAt
+			}
+			s.logger.Error(
+				"sync plain output failed",
+				"group_id", rt.opts.GroupID,
+				"run_id", runID,
+				"cursor", rt.runCursor(runID),
+				"err", err,
+			)
+			return
+		}
+		rt.outputText = mergeBufferedOutput(rt.outputText, raw)
+		rt.commitCursor(runID, rt.nextCursor(runID))
+		s.logOutputStateDebug(rt, "flush plain output committed")
 		return
 	}
 	candidateText := mergeBufferedOutput(rt.outputText, raw)
@@ -1110,6 +1182,10 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 				"sync editable output rate-limited",
 				"group_id",
 				rt.opts.GroupID,
+				"run_id",
+				runID,
+				"cursor",
+				rt.runCursor(runID),
 				"retry_after",
 				retryAfter.String(),
 				"retry_at",
@@ -1119,10 +1195,22 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 			)
 			return
 		}
-		s.logger.Error("sync editable output failed", "group_id", rt.opts.GroupID, "err", err)
+		s.logger.Error(
+			"sync editable output failed",
+			"group_id",
+			rt.opts.GroupID,
+			"run_id",
+			runID,
+			"cursor",
+			rt.runCursor(runID),
+			"err",
+			err,
+		)
 		return
 	}
 	rt.outputText = candidateText
+	rt.commitCursor(runID, rt.nextCursor(runID))
+	s.logOutputStateDebug(rt, "flush editable output committed")
 }
 
 func isMessageNotModifiedError(err error) bool {
@@ -1281,7 +1369,7 @@ func (rt *groupRuntime) hasBufferedOutput() bool {
 	return strings.TrimSpace(rt.outputBuffer) != ""
 }
 
-func (rt *groupRuntime) enqueueDetachedOutput(text string) {
+func (rt *groupRuntime) enqueueDetachedOutput(runID uint64, text string) {
 	if rt == nil {
 		return
 	}
@@ -1289,12 +1377,25 @@ func (rt *groupRuntime) enqueueDetachedOutput(text string) {
 	if strings.TrimSpace(text) == "" {
 		return
 	}
+	cursor := rt.runCursor(runID)
+	for i := len(rt.detachedOutputs) - 1; i >= 0; i-- {
+		item := rt.detachedOutputs[i]
+		if item.runID == runID && item.cursor > cursor {
+			cursor = item.cursor
+		}
+	}
 	for _, chunk := range splitByRunes(text, maxMessageRunes) {
 		chunk = strings.Trim(chunk, "\n")
 		if strings.TrimSpace(chunk) == "" {
 			continue
 		}
-		rt.detachedOutputs = append(rt.detachedOutputs, chunk)
+		cursor++
+		rt.detachedOutputs = append(rt.detachedOutputs, detachedOutput{
+			runID:      runID,
+			cursor:     cursor,
+			text:       chunk,
+			enqueuedAt: time.Now(),
+		})
 	}
 }
 
@@ -1303,6 +1404,16 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 		return
 	}
 	now := time.Now()
+	if s.detachedWatchdogAfter > 0 && !rt.detachedOutputs[0].enqueuedAt.IsZero() && now.Sub(rt.detachedOutputs[0].enqueuedAt) >= s.detachedWatchdogAfter {
+		rt.detachedBackoffUntil = time.Time{}
+		s.logger.Warn(
+			"detached output watchdog forcing retry",
+			"group_id", rt.opts.GroupID,
+			"run_id", rt.detachedOutputs[0].runID,
+			"cursor", rt.detachedOutputs[0].cursor,
+			"age", now.Sub(rt.detachedOutputs[0].enqueuedAt).String(),
+		)
+	}
 	if !rt.detachedBackoffUntil.IsZero() {
 		if rt.detachedBackoffUntil.After(now) {
 			return
@@ -1311,8 +1422,12 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 	}
 
 	for len(rt.detachedOutputs) > 0 {
-		text := rt.detachedOutputs[0]
-		if err := s.messenger.SendTextToChat(context.Background(), rt.opts.GroupID, text); err != nil {
+		item := rt.detachedOutputs[0]
+		if item.cursor <= rt.runCursor(item.runID) {
+			rt.detachedOutputs = rt.detachedOutputs[1:]
+			continue
+		}
+		if err := s.messenger.SendTextToChat(context.Background(), rt.opts.GroupID, item.text); err != nil {
 			retryAfter := retryAfterFromRateLimitError(err)
 			if retryAfter > 0 {
 				rt.detachedBackoffUntil = time.Now().Add(retryAfter)
@@ -1321,6 +1436,10 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 					"flush detached output rate-limited",
 					"group_id",
 					rt.opts.GroupID,
+					"run_id",
+					item.runID,
+					"cursor",
+					item.cursor,
 					"retry_after",
 					retryAfter.String(),
 					"retry_at",
@@ -1336,6 +1455,10 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 					"drop detached output chunk after retries",
 					"group_id",
 					rt.opts.GroupID,
+					"run_id",
+					item.runID,
+					"cursor",
+					item.cursor,
 					"attempts",
 					rt.detachedRetryCount,
 					"err",
@@ -1353,6 +1476,10 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 				"flush detached output failed",
 				"group_id",
 				rt.opts.GroupID,
+				"run_id",
+				item.runID,
+				"cursor",
+				item.cursor,
 				"attempt",
 				rt.detachedRetryCount,
 				"retry_after",
@@ -1366,6 +1493,8 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 		}
 		rt.detachedOutputs = rt.detachedOutputs[1:]
 		rt.detachedRetryCount = 0
+		rt.commitCursor(item.runID, item.cursor)
+		s.logOutputStateDebug(rt, "detached output committed")
 	}
 }
 
@@ -1463,6 +1592,22 @@ func (s *Service) sendBestEffort(groupID string, text string) {
 	if err := s.messenger.SendTextToChat(context.Background(), groupID, text); err != nil {
 		s.logger.Error("send chat message failed", "group_id", groupID, "err", err)
 	}
+}
+
+func (s *Service) logOutputStateDebug(rt *groupRuntime, message string) {
+	if rt == nil {
+		return
+	}
+	s.logger.Debug(
+		message,
+		"group_id", rt.opts.GroupID,
+		"run_id", rt.runID,
+		"busy", rt.lastBusy,
+		"idle_ticks", rt.idleTicks,
+		"cursor", rt.runCursor(rt.runID),
+		"buffer_len", utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
+		"detached_len", len(rt.detachedOutputs),
+	)
 }
 
 func splitByRunes(text string, limit int) []string {

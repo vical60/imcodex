@@ -277,7 +277,9 @@ func (s *Service) runGroup(rt *groupRuntime) {
 			}
 			if !rt.lastBusy && len(rt.pending) > 0 {
 				s.flushOutputBuffer(rt)
-				s.dispatchNext(rt)
+				if !rt.hasBufferedOutput() {
+					s.dispatchNext(rt)
+				}
 			}
 		case <-ticker.C:
 			if !rt.sessionReady {
@@ -291,7 +293,9 @@ func (s *Service) runGroup(rt *groupRuntime) {
 				s.keepLatestPending(rt)
 				if !rt.lastBusy && len(rt.pending) > 0 {
 					s.flushOutputBuffer(rt)
-					s.dispatchNext(rt)
+					if !rt.hasBufferedOutput() {
+						s.dispatchNext(rt)
+					}
 				}
 				continue
 			}
@@ -495,7 +499,9 @@ func (s *Service) poll(rt *groupRuntime) {
 
 	if !busy && len(rt.pending) > 0 {
 		s.flushOutputBuffer(rt)
-		s.dispatchNext(rt)
+		if !rt.hasBufferedOutput() {
+			s.dispatchNext(rt)
+		}
 	}
 }
 
@@ -526,7 +532,9 @@ func (s *Service) resetBufferedOutput(rt *groupRuntime, currText string) {
 	delta, reset := tmuxctl.DiffText(rt.outputText, currText)
 	if reset {
 		rt.outputText = ""
-		rt.replaceOutputBuffer(currText, time.Now())
+		// Keep any already-buffered unsent body and merge the reset snapshot
+		// so transient pane resets do not drop tail output.
+		rt.replaceOutputBuffer(mergeBufferedOutput(rt.outputBuffer, currText), time.Now())
 		return
 	}
 	rt.replaceOutputBuffer(delta, time.Now())
@@ -839,8 +847,7 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 		s.sendChunked(rt.opts.GroupID, text)
 		return
 	}
-	candidateText := rt.outputText + raw
-	candidateText = mergeBufferedOutput(rt.outputText, raw)
+	candidateText := mergeBufferedOutput(rt.outputText, raw)
 	desiredText := strings.Trim(candidateText, "\n")
 	if strings.TrimSpace(desiredText) == "" {
 		rt.outputText = candidateText
@@ -850,6 +857,15 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 		if isMessageNotModifiedError(err) {
 			rt.outputText = candidateText
 			return
+		}
+		if shouldResetEditableThread(err) {
+			rt.outputMessages = nil
+			if retryErr := s.syncEditableOutput(rt, editable, desiredText); retryErr == nil {
+				rt.outputText = candidateText
+				return
+			} else {
+				err = retryErr
+			}
 		}
 		rt.outputBuffer = raw + rt.outputBuffer
 		if rt.outputBufferedAt.IsZero() {
@@ -885,6 +901,22 @@ func isMessageNotModifiedError(err error) bool {
 		return false
 	}
 	return strings.Contains(text, "code=400") || strings.Contains(text, "http=400")
+}
+
+func shouldResetEditableThread(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := strings.ToLower(strings.TrimSpace(err.Error()))
+	if text == "" {
+		return false
+	}
+	if !strings.Contains(text, "code=400") && !strings.Contains(text, "http=400") {
+		return false
+	}
+	return strings.Contains(text, "message to edit not found") ||
+		strings.Contains(text, "message can't be edited") ||
+		strings.Contains(text, "message can not be edited")
 }
 
 func mergeBufferedOutput(existing string, delta string) string {
@@ -1007,6 +1039,13 @@ func (rt *groupRuntime) clearOutputBuffer() {
 	}
 	rt.outputBuffer = ""
 	rt.outputBufferedAt = time.Time{}
+}
+
+func (rt *groupRuntime) hasBufferedOutput() bool {
+	if rt == nil {
+		return false
+	}
+	return strings.TrimSpace(rt.outputBuffer) != ""
 }
 
 func (s *Service) syncEditableOutput(rt *groupRuntime, editable EditableMessenger, desiredText string) error {

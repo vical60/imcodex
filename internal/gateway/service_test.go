@@ -1156,6 +1156,69 @@ func TestServiceEditableMessengerBacksOffAfterRateLimit(t *testing.T) {
 	}
 }
 
+func TestServiceDelaysNextDispatchWhileEditableOutputBackedOff(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"• Working (1s • esc to interrupt)",
+			"• first",
+			"• first",
+			"• first",
+			"• first",
+		},
+	}
+	messenger := &fakeEditableMessenger{
+		editErrs: []error{
+			errors.New("telegram api failed: http=429 code=429 desc=Too Many Requests: retry after 1 retry_after=1"),
+		},
+	}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+	svc.workingAfter = 5 * time.Millisecond
+	svc.flushIdleTicks = 1
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_1",
+		GroupID:   "oc_1",
+		Text:      "first",
+	}); err != nil {
+		t.Fatalf("HandleMessage(first) error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		return messenger.editCount() >= 1
+	})
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_2",
+		GroupID:   "oc_1",
+		Text:      "second",
+	}); err != nil {
+		t.Fatalf("HandleMessage(second) error = %v", err)
+	}
+
+	time.Sleep(200 * time.Millisecond)
+	if got := len(console.allSendTexts()); got != 1 {
+		t.Fatalf("len(sendTexts) during backoff = %d, want 1 (delay second dispatch)", got)
+	}
+
+	waitFor(t, 2*time.Second, func() bool {
+		return len(console.allSendTexts()) >= 2
+	})
+	sendTexts := console.allSendTexts()
+	if got, want := sendTexts[1], "second"; got != want {
+		t.Fatalf("sendTexts[1] = %q, want %q after backoff flush", got, want)
+	}
+}
+
 func TestServiceEditableMessengerDoesNotRetryWhenMessageNotModified(t *testing.T) {
 	t.Parallel()
 
@@ -1199,6 +1262,53 @@ func TestServiceEditableMessengerDoesNotRetryWhenMessageNotModified(t *testing.T
 	time.Sleep(200 * time.Millisecond)
 	if got := messenger.editCount(); got != 1 {
 		t.Fatalf("editCount = %d, want 1 without retry loop on message-not-modified", got)
+	}
+}
+
+func TestServiceEditableMessengerResetsThreadWhenMessageToEditMissing(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"• Working (1s • esc to interrupt)",
+			"• first",
+			"• first\n\n• second",
+			"• first\n\n• second",
+		},
+	}
+	messenger := &fakeEditableMessenger{
+		editErrs: []error{
+			errors.New("telegram api failed: http=400 code=400 desc=Bad Request: message to edit not found"),
+		},
+	}
+
+	svc := NewService(ctx, Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.pollEvery = 5 * time.Millisecond
+	svc.history = 2000
+	svc.startWait = 0
+	svc.workingAfter = 5 * time.Millisecond
+	svc.flushIdleTicks = 1
+
+	if err := svc.HandleMessage(context.Background(), IncomingMessage{
+		MessageID: "om_1",
+		GroupID:   "oc_1",
+		Text:      "hello",
+	}); err != nil {
+		t.Fatalf("HandleMessage() error = %v", err)
+	}
+
+	waitFor(t, 500*time.Millisecond, func() bool {
+		got := nonStatusMessages(messenger.all())
+		return len(got) == 1 && got[0] == "• first\n\n• second"
+	})
+
+	events := strings.Join(messenger.allEvents(), "\n")
+	if !strings.Contains(events, "send:2:• first") {
+		t.Fatalf("events = %#v, want fallback send on missing editable message", messenger.allEvents())
 	}
 }
 

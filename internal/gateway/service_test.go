@@ -51,6 +51,7 @@ type fakeEditableMessenger struct {
 	nextID   int
 	messages []trackedMessage
 	events   []string
+	sendErrs []error
 	editErrs []error
 	edits    int
 }
@@ -63,6 +64,15 @@ func (f *fakeEditableMessenger) SendTextToChat(ctx context.Context, groupID stri
 func (f *fakeEditableMessenger) SendTextToChatWithID(_ context.Context, _ string, text string) (SentMessage, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if len(f.sendErrs) > 0 {
+		err := f.sendErrs[0]
+		if len(f.sendErrs) > 1 {
+			f.sendErrs = f.sendErrs[1:]
+		}
+		if err != nil {
+			return SentMessage{}, err
+		}
+	}
 
 	f.nextID++
 	id := strconv.Itoa(f.nextID)
@@ -1275,6 +1285,90 @@ func TestServiceEditableMessengerBacksOffAfterRateLimit(t *testing.T) {
 	}
 }
 
+func TestServiceEditableRateLimitBlocksDetachedFlushViaSharedOutputBackoff(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeEditableMessenger{
+		nextID: 1,
+		messages: []trackedMessage{
+			{messageID: "1", text: "• first"},
+		},
+		editErrs: []error{
+			errors.New("telegram api failed: http=429 code=429 desc=Too Many Requests: retry after 5 retry_after=5"),
+		},
+	}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	rt := &groupRuntime{
+		opts:             svc.opts,
+		runID:            5,
+		nextRunID:        5,
+		outputText:       "• first",
+		outputBuffer:     "\n\n• second",
+		outputBufferedAt: time.Now(),
+		outputMessages: []trackedMessage{
+			{messageID: "1", text: "• first"},
+		},
+	}
+
+	svc.flushOutputBuffer(rt) // trigger editable 429
+	if rt.outputBackoffUntil.IsZero() {
+		t.Fatal("outputBackoffUntil = zero, want shared backoff after editable 429")
+	}
+
+	rt.enqueueDetachedOutput(5, "detached chunk")
+	before := len(messenger.all())
+	svc.flushDetachedOutputs(rt)
+	after := len(messenger.all())
+
+	if after != before {
+		t.Fatalf("detached flush sent during shared backoff: before=%d after=%d", before, after)
+	}
+	if got := len(rt.detachedOutputs); got == 0 {
+		t.Fatalf("len(detachedOutputs) = %d, want queue retained during shared backoff", got)
+	}
+}
+
+func TestServiceDetachedRateLimitBlocksEditableFlushViaSharedOutputBackoff(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeEditableMessenger{
+		nextID: 1,
+		sendErrs: []error{
+			errors.New("telegram api failed: http=429 code=429 desc=Too Many Requests: retry after 5 retry_after=5"),
+		},
+		messages: []trackedMessage{
+			{messageID: "1", text: "• first"},
+		},
+	}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	rt := &groupRuntime{
+		opts: svc.opts,
+		outputMessages: []trackedMessage{
+			{messageID: "1", text: "• first"},
+		},
+		outputText: "• first",
+	}
+
+	rt.enqueueDetachedOutput(5, "detached chunk")
+	svc.flushDetachedOutputs(rt) // trigger detached 429
+	if rt.outputBackoffUntil.IsZero() {
+		t.Fatal("outputBackoffUntil = zero, want shared backoff after detached 429")
+	}
+
+	rt.outputBuffer = "\n• second"
+	rt.outputBufferedAt = time.Now()
+	before := messenger.editCount()
+	svc.flushOutputBuffer(rt)
+	after := messenger.editCount()
+
+	if after != before {
+		t.Fatalf("editable flush sent during shared backoff: before=%d after=%d", before, after)
+	}
+	if got := strings.TrimSpace(rt.outputBuffer); got != "• second" {
+		t.Fatalf("outputBuffer = %q, want buffered tail retained while shared backoff active", got)
+	}
+}
+
 func TestServiceDispatchesNextPromptWhileEditableOutputBackedOff(t *testing.T) {
 	t.Parallel()
 
@@ -1377,6 +1471,7 @@ func TestServiceDetachedOutputRetriesChunkWithoutReplay(t *testing.T) {
 	}
 
 	rt.detachedBackoffUntil = time.Time{}
+	rt.outputBackoffUntil = time.Time{}
 	svc.flushDetachedOutputs(rt)
 
 	final := messenger.all()
@@ -1508,6 +1603,44 @@ func TestServiceDetachedOutputDoesNotDropByCursor(t *testing.T) {
 	}
 	if len(rt.detachedOutputs) != 0 {
 		t.Fatalf("len(detachedOutputs) = %d, want 0", len(rt.detachedOutputs))
+	}
+}
+
+func TestServiceFlushOutputBufferRedirectsToDetachedQueueWhenBacklogExists(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeEditableMessenger{
+		messages: []trackedMessage{
+			{messageID: "1", text: "• synced"},
+		},
+	}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	rt := &groupRuntime{
+		opts:             svc.opts,
+		runID:            5,
+		nextRunID:        5,
+		outputText:       "• synced",
+		outputBuffer:     "\n• new tail",
+		outputBufferedAt: time.Now(),
+		outputMessages: []trackedMessage{
+			{messageID: "1", text: "• synced"},
+		},
+		detachedOutputs: []detachedOutput{
+			{runID: 5, cursor: 1, text: "• pending", enqueuedAt: time.Now()},
+		},
+	}
+
+	svc.flushOutputBuffer(rt)
+
+	if got := messenger.editCount(); got != 0 {
+		t.Fatalf("editCount = %d, want 0 when detached backlog exists", got)
+	}
+	if got := len(rt.detachedOutputs); got < 2 {
+		t.Fatalf("len(detachedOutputs) = %d, want new tail appended to detached queue", got)
+	}
+	last := rt.detachedOutputs[len(rt.detachedOutputs)-1].text
+	if last != "• new tail" {
+		t.Fatalf("last detached chunk = %q, want %q", last, "• new tail")
 	}
 }
 
@@ -2201,6 +2334,169 @@ func TestServicePollResetMergesExistingBufferedTailInsteadOfReplacing(t *testing
 	}
 	if !strings.Contains(rt.outputBuffer, "• delta") {
 		t.Fatalf("outputBuffer = %q, want new reset delta merged", rt.outputBuffer)
+	}
+}
+
+func TestServiceDoesNotDispatchPendingOnSingleIdleFlickerWhileRunInFlight(t *testing.T) {
+	t.Parallel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"• Working (1s • esc to interrupt)",
+			"",
+			"",
+			"",
+		},
+	}
+	messenger := &fakeMessenger{}
+
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.idleConfirmTicks = 3
+
+	rt := &groupRuntime{
+		opts:         svc.opts,
+		session:      svc.opts.SessionName,
+		sessionReady: true,
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "first",
+		},
+		lastBusy: true,
+		pending: []IncomingMessage{
+			{MessageID: "om_2", GroupID: "oc_1", Text: "second"},
+		},
+	}
+
+	svc.poll(rt) // idle flicker
+	if got := console.allSendTexts(); len(got) != 0 {
+		t.Fatalf("sendTexts after single idle flicker = %#v, want no premature dispatch", got)
+	}
+
+	svc.poll(rt) // busy again
+	if got := console.allSendTexts(); len(got) != 0 {
+		t.Fatalf("sendTexts after busy resume = %#v, want still no dispatch", got)
+	}
+
+	// Confirm idle for enough ticks, then dispatch should happen once.
+	svc.poll(rt)
+	svc.poll(rt)
+	svc.poll(rt)
+	sendTexts := console.allSendTexts()
+	if len(sendTexts) != 1 || sendTexts[0] != "second" {
+		t.Fatalf("sendTexts = %#v, want dispatch after confirmed idle", sendTexts)
+	}
+}
+
+func TestServiceResetBufferedOutputIgnoresShrinkingResetWhileRunInFlight(t *testing.T) {
+	t.Parallel()
+
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, &fakeMessenger{}, &fakeConsole{}, nil, slog.Default())
+	rt := &groupRuntime{
+		outputText: "• alpha\n• beta\n• gamma",
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "first",
+		},
+	}
+
+	svc.resetBufferedOutput(rt, "• alpha\n• beta")
+
+	if got, want := rt.outputText, "• alpha\n• beta\n• gamma"; got != want {
+		t.Fatalf("outputText = %q, want baseline unchanged on shrinking reset", got)
+	}
+	if got := rt.outputBuffer; got != "" {
+		t.Fatalf("outputBuffer = %q, want unchanged empty buffer", got)
+	}
+}
+
+func TestServicePollDeferredShrinkingResetDoesNotAdvanceLastTextAndStillFlushesTail(t *testing.T) {
+	t.Parallel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"• alpha\n• beta\n• Working (1s • esc to interrupt)",
+			"• alpha\n• beta\n• gamma\n• delta",
+		},
+	}
+	messenger := &fakeMessenger{}
+
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.idleConfirmTicks = 1
+	svc.flushIdleTicks = 1
+	svc.busyFlushAfter = time.Hour
+
+	const baseline = "• alpha\n• beta\n• gamma"
+	rt := &groupRuntime{
+		opts:         svc.opts,
+		session:      svc.opts.SessionName,
+		sessionReady: true,
+		outputArmed:  true,
+		lastText:     baseline,
+		outputText:   baseline,
+		lastBusy:     true,
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "prompt",
+		},
+	}
+
+	svc.poll(rt)
+	if got := rt.lastText; got != baseline {
+		t.Fatalf("lastText after deferred shrinking reset = %q, want unchanged baseline %q", got, baseline)
+	}
+	if got := nonStatusMessages(messenger.all()); len(got) != 0 {
+		t.Fatalf("messages after deferred shrinking reset = %#v, want none yet", got)
+	}
+
+	svc.poll(rt)
+
+	got := nonStatusMessages(messenger.all())
+	if len(got) != 1 || got[0] != "• delta" {
+		t.Fatalf("messages after idle reconciliation = %#v, want tail forwarded without pending trigger", got)
+	}
+}
+
+func TestServicePollEmptyBodyJitterWhileWorkingDoesNotReplayOldOutput(t *testing.T) {
+	t.Parallel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"• Working (1s • esc to interrupt)",
+			"• stable body\n• Working (2s • esc to interrupt)",
+			"• Working (3s • esc to interrupt)",
+			"• stable body\n• Working (4s • esc to interrupt)",
+		},
+	}
+	messenger := &fakeMessenger{}
+
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.flushIdleTicks = 1
+	svc.busyFlushAfter = 5 * time.Millisecond
+	svc.idleConfirmTicks = 3
+
+	const stable = "• stable body"
+	rt := &groupRuntime{
+		opts:         svc.opts,
+		session:      svc.opts.SessionName,
+		sessionReady: true,
+		outputArmed:  true,
+		lastText:     stable,
+		outputText:   stable,
+		lastBusy:     true,
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "prompt",
+		},
+	}
+
+	svc.poll(rt)
+	svc.poll(rt)
+	svc.poll(rt)
+	svc.poll(rt)
+
+	if got := nonStatusMessages(messenger.all()); len(got) != 0 {
+		t.Fatalf("messages = %#v, want no replay when only working-line jitter happens", got)
 	}
 }
 

@@ -22,6 +22,7 @@ const (
 	queueSize               = 64
 	recentMessageIDLimit    = 256
 	defaultFlushIdleTicks   = 8
+	defaultIdleConfirmTicks = 3
 	defaultWorkingAfter     = time.Second
 	defaultChatActionEvery  = 4 * time.Second
 	defaultBusyFlushAfter   = 5 * time.Second
@@ -97,6 +98,7 @@ type Service struct {
 	startWait             time.Duration
 	history               int
 	flushIdleTicks        int
+	idleConfirmTicks      int
 	workingAfter          time.Duration
 	chatActionEvery       time.Duration
 	busyFlushAfter        time.Duration
@@ -137,6 +139,7 @@ type groupRuntime struct {
 	outputText           string
 	outputMessages       []trackedMessage
 	detachedOutputs      []detachedOutput
+	outputBackoffUntil   time.Time
 	detachedBackoffUntil time.Time
 	detachedRetryCount   int
 	editBackoffUntil     time.Time
@@ -180,6 +183,7 @@ func NewService(ctx context.Context, opts Options, messenger Messenger, console 
 		startWait:             4 * time.Second,
 		history:               2000,
 		flushIdleTicks:        defaultFlushIdleTicks,
+		idleConfirmTicks:      defaultIdleConfirmTicks,
 		workingAfter:          defaultWorkingAfter,
 		chatActionEvery:       defaultChatActionEvery,
 		busyFlushAfter:        defaultBusyFlushAfter,
@@ -296,10 +300,10 @@ func (s *Service) runGroup(rt *groupRuntime) {
 				s.keepLatestPending(rt)
 			}
 			s.flushDetachedOutputs(rt)
-			if s.opts.InterruptOnNewMessage && rt.lastBusy && len(rt.pending) > 0 {
+			if s.opts.InterruptOnNewMessage && rt.runInFlight() && len(rt.pending) > 0 {
 				s.requestInterrupt(rt)
 			}
-			if !rt.lastBusy && len(rt.pending) > 0 {
+			if !rt.runInFlight() && len(rt.pending) > 0 {
 				s.dispatchNext(rt)
 			}
 		case <-ticker.C:
@@ -313,10 +317,10 @@ func (s *Service) runGroup(rt *groupRuntime) {
 					continue
 				}
 				s.keepLatestPending(rt)
-				if !rt.lastBusy && rt.hasBufferedOutput() {
+				if !rt.runInFlight() && rt.hasBufferedOutput() {
 					s.flushOutputBuffer(rt)
 				}
-				if !rt.lastBusy && len(rt.pending) > 0 {
+				if !rt.runInFlight() && len(rt.pending) > 0 {
 					s.dispatchNext(rt)
 				}
 				continue
@@ -336,6 +340,7 @@ func (s *Service) ensureSession(rt *groupRuntime) error {
 		len(rt.outputMessages) > 0 ||
 		len(rt.detachedOutputs) > 0 ||
 		rt.promptEchoPending ||
+		!rt.outputBackoffUntil.IsZero() ||
 		!rt.detachedBackoffUntil.IsZero() ||
 		!rt.editBackoffUntil.IsZero()
 
@@ -367,6 +372,7 @@ func (s *Service) ensureSession(rt *groupRuntime) error {
 		rt.outputMessages = nil
 		rt.promptEchoTail = ""
 		rt.promptEchoPending = false
+		rt.outputBackoffUntil = time.Time{}
 		rt.detachedBackoffUntil = time.Time{}
 		rt.detachedRetryCount = 0
 		rt.editBackoffUntil = time.Time{}
@@ -429,6 +435,7 @@ func (s *Service) dispatchNext(rt *groupRuntime) {
 		rt.outputText = ""
 		rt.outputMessages = nil
 		rt.detachedOutputs = nil
+		rt.outputBackoffUntil = time.Time{}
 		rt.detachedBackoffUntil = time.Time{}
 		rt.detachedRetryCount = 0
 		rt.editBackoffUntil = time.Time{}
@@ -466,6 +473,11 @@ func (s *Service) finalizeOutputBeforeDispatch(rt *groupRuntime) bool {
 	}
 	currText := tmuxctl.SliceAfter(rt.baseText, currFullText)
 	currText = strings.Trim(currText, "\n")
+	// If a run is still in-flight but boundary capture currently shows no tail,
+	// defer dispatch and let poll confirm idle over multiple ticks.
+	if strings.TrimSpace(currText) == "" && rt.active != nil {
+		return false
+	}
 	if strings.TrimSpace(currText) == "" {
 		return true
 	}
@@ -564,10 +576,9 @@ func (s *Service) poll(rt *groupRuntime) {
 		}
 	}
 	delta, reset := tmuxctl.DiffText(prevText, currText)
-	busy := tmuxctl.IsBusy(snapshot)
-	becameIdle := rt.lastBusy && !busy
+	busyRaw := tmuxctl.IsBusy(snapshot)
 
-	if busy {
+	if busyRaw {
 		rt.idleTicks = 0
 		if rt.outputText == "" {
 			s.sendChatAction(rt)
@@ -589,10 +600,21 @@ func (s *Service) poll(rt *groupRuntime) {
 	} else {
 		rt.idleTicks++
 	}
+	idleConfirmTicks := s.idleConfirmTicks
+	if idleConfirmTicks <= 0 {
+		idleConfirmTicks = 1
+	}
+	busy := busyRaw || (rt.active != nil && rt.idleTicks < idleConfirmTicks)
+	becameIdle := rt.lastBusy && !busy
 
+	deferSnapshotCommit := false
 	if rt.outputArmed {
 		if reset {
-			s.resetBufferedOutput(rt, currText)
+			if !s.resetBufferedOutput(rt, currText) {
+				// Keep previous snapshot baseline so deferred reset can be
+				// reconciled on the next poll instead of silently advancing.
+				deferSnapshotCommit = true
+			}
 		} else {
 			rt.appendOutputBuffer(delta, now)
 		}
@@ -611,7 +633,9 @@ func (s *Service) poll(rt *groupRuntime) {
 		s.applyOutputWatchdog(rt, now)
 	}
 
-	rt.lastText = currFullText
+	if !deferSnapshotCommit {
+		rt.lastText = currFullText
+	}
 	busyChanged := rt.lastBusy != busy
 	rt.lastBusy = busy
 	if !busy {
@@ -749,31 +773,64 @@ func suppressPromptEchoPrefix(text string, echoTail string) (string, bool) {
 	return text, false
 }
 
-func (s *Service) resetBufferedOutput(rt *groupRuntime, currText string) {
+func (s *Service) resetBufferedOutput(rt *groupRuntime, currText string) bool {
 	if rt == nil {
-		return
+		return true
 	}
 	currText = strings.Trim(currText, "\n")
 	if strings.TrimSpace(currText) == "" {
+		// While a run is still in-flight, an empty capture can be transient
+		// (pane refresh/window jitter). Keep baseline and retry next poll
+		// instead of resetting and replaying old body as "new" output.
+		if rt.active != nil {
+			return false
+		}
 		rt.outputText = ""
 		if !rt.hasBufferedOutput() {
 			rt.clearOutputBuffer()
 		}
-		return
+		return true
+	}
+
+	// When nothing has been synced yet, prefer reconciling against the unsent
+	// buffer directly so reset handling can distinguish "revised snapshot"
+	// from "truncated window" without duplicating content.
+	if strings.TrimSpace(rt.outputText) == "" && strings.TrimSpace(rt.outputBuffer) != "" {
+		deltaBuf, resetBuf := tmuxctl.DiffText(rt.outputBuffer, currText)
+		if resetBuf {
+			if len(currText) >= len(rt.outputBuffer) {
+				rt.replaceOutputBuffer(currText, time.Now())
+			} else {
+				rt.replaceOutputBuffer(mergeBufferedOutput(rt.outputBuffer, currText), time.Now())
+			}
+			return true
+		}
+		if strings.TrimSpace(deltaBuf) == "" {
+			return true
+		}
+		rt.replaceOutputBuffer(mergeBufferedOutput(rt.outputBuffer, deltaBuf), time.Now())
+		return true
 	}
 
 	delta, reset := tmuxctl.DiffText(rt.outputText, currText)
 	if reset {
+		// If the pane snapshot temporarily shrinks while the run is still
+		// active, keep the already-synced baseline and wait for a stable
+		// snapshot instead of rewriting to a shorter body.
+		if rt.active != nil && utf8.RuneCountInString(currText) < utf8.RuneCountInString(rt.outputText) {
+			return false
+		}
 		rt.outputText = ""
 		// Keep any already-buffered unsent body and merge the reset snapshot
 		// so transient pane resets do not drop tail output.
 		rt.replaceOutputBuffer(mergeBufferedOutput(rt.outputBuffer, currText), time.Now())
-		return
+		return true
 	}
 	if strings.TrimSpace(delta) == "" {
-		return
+		return true
 	}
 	rt.replaceOutputBuffer(mergeBufferedOutput(rt.outputBuffer, delta), time.Now())
+	return true
 }
 
 func (s *Service) enqueuePending(rt *groupRuntime, msg IncomingMessage) {
@@ -781,7 +838,7 @@ func (s *Service) enqueuePending(rt *groupRuntime, msg IncomingMessage) {
 		rt.pending = []IncomingMessage{msg}
 		return
 	}
-	if s.opts.InterruptOnNewMessage && rt.lastBusy {
+	if s.opts.InterruptOnNewMessage && rt.runInFlight() {
 		rt.pending = []IncomingMessage{msg}
 		return
 	}
@@ -789,7 +846,7 @@ func (s *Service) enqueuePending(rt *groupRuntime, msg IncomingMessage) {
 }
 
 func (s *Service) requestInterrupt(rt *groupRuntime) {
-	if !rt.sessionReady || !rt.lastBusy || !rt.interruptSentAt.IsZero() {
+	if !rt.sessionReady || !rt.runInFlight() || !rt.interruptSentAt.IsZero() {
 		return
 	}
 	if err := s.console.Interrupt(s.ctx, rt.session); err != nil {
@@ -1086,7 +1143,8 @@ func (s *Service) detachBufferedOutput(rt *groupRuntime) {
 		rt.enqueueDetachedOutput(runID, unsent)
 	}
 	rt.clearOutputBuffer()
-	rt.outputText = ""
+	// Keep delivery baseline aligned with detached handoff.
+	rt.outputText = candidate
 	rt.outputMessages = nil
 	rt.editBackoffUntil = time.Time{}
 	rt.detachedRetryCount = 0
@@ -1140,6 +1198,9 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 		return
 	}
 	now := time.Now()
+	if rt.outputBackoffActive(now) {
+		return
+	}
 	if !rt.editBackoffUntil.IsZero() {
 		if rt.editBackoffUntil.After(now) {
 			return
@@ -1155,6 +1216,19 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 	runID := rt.runID
 	if runID == 0 {
 		runID = rt.nextRunID
+	}
+	if len(rt.detachedOutputs) > 0 {
+		candidateText := mergeBufferedOutput(rt.outputText, raw)
+		text := strings.Trim(raw, "\n")
+		if strings.TrimSpace(text) == "" {
+			return
+		}
+		rt.enqueueDetachedOutput(runID, text)
+		// Advance observed delivery baseline once accepted into detached queue.
+		// This avoids replaying the same chunk on pane reset jitter.
+		rt.outputText = candidateText
+		s.logOutputStateDebug(rt, "flush redirected to detached queue while backlog exists")
+		return
 	}
 	editable := s.editableMessenger()
 	if editable == nil {
@@ -1206,6 +1280,7 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 		}
 		if retryAfter := retryAfterFromRateLimitError(err); retryAfter > 0 {
 			rt.editBackoffUntil = time.Now().Add(retryAfter)
+			rt.applyOutputBackoff(retryAfter)
 			s.logger.Warn(
 				"sync editable output rate-limited",
 				"group_id",
@@ -1217,7 +1292,7 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 				"retry_after",
 				retryAfter.String(),
 				"retry_at",
-				rt.editBackoffUntil,
+				rt.outputBackoffUntil,
 				"err",
 				err,
 			)
@@ -1407,8 +1482,37 @@ func (rt *groupRuntime) hasRecoverableOutputState() bool {
 		len(rt.outputMessages) > 0 ||
 		len(rt.detachedOutputs) > 0 ||
 		rt.promptEchoPending ||
+		!rt.outputBackoffUntil.IsZero() ||
 		!rt.detachedBackoffUntil.IsZero() ||
 		!rt.editBackoffUntil.IsZero()
+}
+
+func (rt *groupRuntime) runInFlight() bool {
+	if rt == nil {
+		return false
+	}
+	return rt.lastBusy || rt.active != nil
+}
+
+func (rt *groupRuntime) outputBackoffActive(now time.Time) bool {
+	if rt == nil || rt.outputBackoffUntil.IsZero() {
+		return false
+	}
+	if rt.outputBackoffUntil.After(now) {
+		return true
+	}
+	rt.outputBackoffUntil = time.Time{}
+	return false
+}
+
+func (rt *groupRuntime) applyOutputBackoff(retryAfter time.Duration) {
+	if rt == nil || retryAfter <= 0 {
+		return
+	}
+	retryAt := time.Now().Add(retryAfter)
+	if retryAt.After(rt.outputBackoffUntil) {
+		rt.outputBackoffUntil = retryAt
+	}
 }
 
 func (rt *groupRuntime) enqueueDetachedOutput(runID uint64, text string) {
@@ -1445,6 +1549,9 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 		return
 	}
 	now := time.Now()
+	if rt.outputBackoffActive(now) {
+		return
+	}
 	if s.detachedWatchdogAfter > 0 && !rt.detachedOutputs[0].enqueuedAt.IsZero() && now.Sub(rt.detachedOutputs[0].enqueuedAt) >= s.detachedWatchdogAfter {
 		rt.detachedBackoffUntil = time.Time{}
 		s.logger.Warn(
@@ -1468,6 +1575,7 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 			retryAfter := retryAfterFromRateLimitError(err)
 			if retryAfter > 0 {
 				rt.detachedBackoffUntil = time.Now().Add(retryAfter)
+				rt.applyOutputBackoff(retryAfter)
 				rt.detachedRetryCount = 0
 				s.logger.Warn(
 					"flush detached output rate-limited",
@@ -1480,7 +1588,7 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 					"retry_after",
 					retryAfter.String(),
 					"retry_at",
-					rt.detachedBackoffUntil,
+					rt.outputBackoffUntil,
 					"err",
 					err,
 				)

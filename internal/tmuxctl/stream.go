@@ -97,6 +97,23 @@ func SliceAfter(base string, curr string) string {
 func IsBusy(snapshot string) bool {
 	snapshot = stripANSI(snapshot)
 	lines := strings.Split(snapshot, "\n")
+	if promptIdx := lastPromptLineIndex(lines); promptIdx >= 0 {
+		start := promptIdx - 8
+		if start < 0 {
+			start = 0
+		}
+		end := promptIdx + 2
+		if end >= len(lines) {
+			end = len(lines) - 1
+		}
+		for i := start; i <= end; i++ {
+			lower := strings.ToLower(strings.TrimSpace(lines[i]))
+			if strings.Contains(lower, "esc to interrupt") {
+				return true
+			}
+		}
+		return false
+	}
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
@@ -179,6 +196,15 @@ func isPromptLine(line string) bool {
 		return false
 	}
 	return line == "›" || line == ">" || strings.HasPrefix(line, "›") || strings.HasPrefix(line, ">")
+}
+
+func lastPromptLineIndex(lines []string) int {
+	for i := len(lines) - 1; i >= 0; i-- {
+		if isPromptLine(strings.TrimSpace(lines[i])) {
+			return i
+		}
+	}
+	return -1
 }
 
 func suffixPrefixOverlap(prev string, curr string) int {

@@ -101,6 +101,24 @@ func TestIsBusyHandlesTrailingPromptPlaceholder(t *testing.T) {
 	}
 }
 
+func TestIsBusyUsesPromptAdjacentWindow(t *testing.T) {
+	t.Parallel()
+
+	raw := "• partial output\n• Working (28s • esc to interrupt)\n\n› Implement {feature}\n\n  gpt-5.4 high · 19% left · ~/repo"
+	if !IsBusy(raw) {
+		t.Fatal("IsBusy() = false, want true when working chrome is near prompt")
+	}
+}
+
+func TestIsBusyFalseWhenPromptPresentWithoutWorkingChrome(t *testing.T) {
+	t.Parallel()
+
+	raw := "• final answer\n\n› Improve documentation in @filename\n\n  gpt-5.4 high · 92% left · ~/repo"
+	if IsBusy(raw) {
+		t.Fatal("IsBusy() = true, want false when prompt is present without working chrome")
+	}
+}
+
 func TestNormalizeSnapshotKeepsModelLikeContentLines(t *testing.T) {
 	t.Parallel()
 

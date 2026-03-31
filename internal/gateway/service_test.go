@@ -2131,6 +2131,55 @@ func TestServicePreservesBufferedOutputAcrossCaptureFailure(t *testing.T) {
 	})
 }
 
+func TestServiceKeepsRunInFlightAcrossCaptureFailureWithoutOutputYet(t *testing.T) {
+	t.Parallel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"",
+		},
+		captureErrors: []error{
+			errors.New("tmux temporary failure"),
+			nil,
+			nil,
+		},
+	}
+	messenger := &fakeMessenger{}
+
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.silentBusyGrace = time.Hour
+
+	rt := &groupRuntime{
+		opts:         svc.opts,
+		session:      svc.opts.SessionName,
+		sessionReady: true,
+		outputArmed:  true,
+		lastBusy:     true,
+		busySince:    time.Now(),
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "first",
+		},
+	}
+
+	svc.poll(rt)
+	if rt.active == nil {
+		t.Fatal("active = nil after capture failure, want run preserved")
+	}
+	if !rt.lastBusy {
+		t.Fatal("lastBusy = false after capture failure, want in-flight run preserved")
+	}
+
+	svc.poll(rt)
+	if rt.active == nil {
+		t.Fatal("active = nil after recovery poll, want run still in-flight")
+	}
+	if rt.busySince.IsZero() {
+		t.Fatal("busySince = zero after recovery poll, want silent-run grace preserved")
+	}
+}
+
 func TestServiceRecoversSessionAfterCaptureFailureEvenWithoutBufferedDelta(t *testing.T) {
 	t.Parallel()
 
@@ -2220,6 +2269,8 @@ func TestServiceFlushesBufferedReplyBeforeDispatchingNextMessage(t *testing.T) {
 	svc.pollEvery = 20 * time.Millisecond
 	svc.history = 2000
 	svc.startWait = 0
+	svc.silentBusyGrace = 0
+	svc.idleConfirmTicks = 1
 	svc.flushIdleTicks = 50
 
 	if err := svc.HandleMessage(context.Background(), IncomingMessage{
@@ -2481,9 +2532,9 @@ func TestServiceQueuesSecondMessageUntilBusyClears(t *testing.T) {
 		captures: []string{
 			"",
 			"• Working (1s • esc to interrupt)",
-			"• Working (2s • esc to interrupt)",
-			"",
-			"",
+			"• partial reply\n• Working (2s • esc to interrupt)",
+			"• partial reply",
+			"• partial reply",
 		},
 	}
 	messenger := &fakeMessenger{}
@@ -2602,6 +2653,90 @@ func TestServiceDoesNotDispatchPendingOnSingleIdleFlickerWhileRunInFlight(t *tes
 	sendTexts := console.allSendTexts()
 	if len(sendTexts) != 1 || sendTexts[0] != "second" {
 		t.Fatalf("sendTexts = %#v, want dispatch after confirmed idle", sendTexts)
+	}
+}
+
+func TestServiceDoesNotDispatchPendingDuringSilentRunBeforeGraceExpires(t *testing.T) {
+	t.Parallel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+			"",
+			"",
+		},
+	}
+	messenger := &fakeMessenger{}
+
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.idleConfirmTicks = 1
+	svc.silentBusyGrace = time.Hour
+
+	rt := &groupRuntime{
+		opts:         svc.opts,
+		session:      svc.opts.SessionName,
+		sessionReady: true,
+		busySince:    time.Now(),
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "first",
+		},
+		lastBusy: true,
+		pending: []IncomingMessage{
+			{MessageID: "om_2", GroupID: "oc_1", Text: "second"},
+		},
+	}
+
+	svc.poll(rt)
+	svc.poll(rt)
+	svc.poll(rt)
+
+	if got := console.allSendTexts(); len(got) != 0 {
+		t.Fatalf("sendTexts = %#v, want no dispatch while silent-run grace is active", got)
+	}
+	if rt.active == nil {
+		t.Fatal("active = nil, want run kept in-flight during silent-run grace")
+	}
+}
+
+func TestServiceDispatchesPendingAfterSilentRunGraceExpires(t *testing.T) {
+	t.Parallel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"",
+		},
+	}
+	messenger := &fakeMessenger{}
+
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.idleConfirmTicks = 1
+	svc.silentBusyGrace = 10 * time.Minute
+
+	rt := &groupRuntime{
+		opts:         svc.opts,
+		session:      svc.opts.SessionName,
+		sessionReady: true,
+		busySince:    time.Now().Add(-11 * time.Minute),
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "first",
+		},
+		lastBusy: true,
+		pending: []IncomingMessage{
+			{MessageID: "om_2", GroupID: "oc_1", Text: "second"},
+		},
+	}
+
+	svc.poll(rt)
+
+	sendTexts := console.allSendTexts()
+	if len(sendTexts) != 1 || sendTexts[0] != "second" {
+		t.Fatalf("sendTexts = %#v, want dispatch after silent-run grace expires", sendTexts)
+	}
+	if rt.active == nil {
+		// dispatchNext will immediately start the next run, so active should not stay nil.
+		t.Fatal("active = nil, want next run dispatched")
 	}
 }
 
@@ -2759,6 +2894,7 @@ func TestServiceInterruptsCurrentRunOnNewMessageWhenEnabled(t *testing.T) {
 	svc.pollEvery = 20 * time.Millisecond
 	svc.history = 2000
 	svc.startWait = 0
+	svc.silentBusyGrace = 0
 	svc.interruptForceAfter = 500 * time.Millisecond
 
 	if err := svc.HandleMessage(context.Background(), IncomingMessage{MessageID: "om_1", GroupID: "oc_1", Text: "first"}); err != nil {

@@ -29,6 +29,7 @@ const (
 	defaultOutputWatchdog   = 8 * time.Second
 	defaultDetachedWatchdog = 15 * time.Second
 	defaultEditRolloverAt   = 2800
+	defaultSilentBusyGrace  = 20 * time.Minute
 	workingStatusText       = "[working] Codex is processing."
 )
 
@@ -109,6 +110,7 @@ type Service struct {
 	outputWatchdogAfter   time.Duration
 	detachedWatchdogAfter time.Duration
 	editRolloverAt        int
+	silentBusyGrace       time.Duration
 	interruptForceAfter   time.Duration
 
 	mu      sync.Mutex
@@ -195,6 +197,7 @@ func NewService(ctx context.Context, opts Options, messenger Messenger, console 
 		outputWatchdogAfter:   defaultOutputWatchdog,
 		detachedWatchdogAfter: defaultDetachedWatchdog,
 		editRolloverAt:        defaultEditRolloverAt,
+		silentBusyGrace:       defaultSilentBusyGrace,
 		interruptForceAfter:   time.Second,
 	}
 }
@@ -370,6 +373,14 @@ func (s *Service) ensureSession(rt *groupRuntime) error {
 		rt.baseText = ""
 	}
 	rt.lastBusy = tmuxctl.IsBusy(snapshot)
+	if recoveringOutput && rt.active != nil {
+		currText := strings.Trim(tmuxctl.SliceAfter(rt.baseText, captured), "\n")
+		if !rt.lastBusy && !s.shouldHoldBusyForSilentRun(rt, currText, time.Now()) {
+			rt.active = nil
+			rt.busySince = time.Time{}
+			rt.workingSent = false
+		}
+	}
 	rt.idleTicks = 0
 	if !recoveringOutput {
 		rt.clearOutputBuffer()
@@ -384,8 +395,12 @@ func (s *Service) ensureSession(rt *groupRuntime) error {
 		rt.deferBodyUntilIdle = false
 	}
 	rt.outputArmed = recoveringOutput
-	rt.busySince = time.Time{}
-	rt.workingSent = false
+	if rt.active == nil {
+		rt.busySince = time.Time{}
+		rt.workingSent = false
+	} else if rt.busySince.IsZero() && rt.lastBusy {
+		rt.busySince = time.Now()
+	}
 	rt.lastActionAt = time.Time{}
 	rt.interruptSentAt = time.Time{}
 	rt.forceInterruptSent = false
@@ -558,16 +573,18 @@ func (s *Service) poll(rt *groupRuntime) {
 	if err != nil {
 		s.logger.Warn("capture tmux pane failed", "group_id", rt.opts.GroupID, "session", rt.session, "err", err)
 		rt.sessionReady = false
-		rt.lastBusy = false
 		rt.idleTicks = 0
 		if !rt.hasRecoverableOutputState() {
 			rt.baseText = ""
 			rt.lastText = ""
 		}
-		rt.busySince = time.Time{}
-		rt.workingSent = false
 		rt.lastActionAt = time.Time{}
-		rt.active = nil
+		if !rt.runInFlight() {
+			rt.lastBusy = false
+			rt.busySince = time.Time{}
+			rt.workingSent = false
+			rt.active = nil
+		}
 		return
 	}
 
@@ -585,6 +602,9 @@ func (s *Service) poll(rt *groupRuntime) {
 	}
 	delta, reset := tmuxctl.DiffText(prevText, currText)
 	busyRaw := tmuxctl.IsBusy(snapshot)
+	if !busyRaw && s.shouldHoldBusyForSilentRun(rt, currText, now) {
+		busyRaw = true
+	}
 	if busyRaw {
 		rt.idleTicks = 0
 		if rt.outputText == "" {
@@ -749,6 +769,37 @@ func shouldFlushOnSize(rt *groupRuntime, softLimit int, hardLimit int) bool {
 		return false
 	}
 	return utf8.RuneCountInString(candidate) >= limit
+}
+
+func (s *Service) shouldHoldBusyForSilentRun(rt *groupRuntime, currText string, now time.Time) bool {
+	if rt == nil || rt.active == nil || s.silentBusyGrace <= 0 || rt.busySince.IsZero() {
+		return false
+	}
+	if !rt.interruptSentAt.IsZero() {
+		return false
+	}
+	if now.Sub(rt.busySince) >= s.silentBusyGrace {
+		return false
+	}
+	return !hasVisibleRunOutput(rt, currText)
+}
+
+func hasVisibleRunOutput(rt *groupRuntime, currText string) bool {
+	if rt == nil {
+		return false
+	}
+	if strings.TrimSpace(currText) != "" ||
+		rt.hasBufferedOutput() ||
+		strings.TrimSpace(rt.outputText) != "" ||
+		len(rt.detachedOutputs) > 0 {
+		return true
+	}
+	for _, msg := range rt.outputMessages {
+		if strings.TrimSpace(msg.text) != "" && msg.text != workingStatusText {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Service) shouldDeferBodyFlush(rt *groupRuntime, now time.Time) bool {

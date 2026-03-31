@@ -27,6 +27,16 @@
 | Replay risk under 429 | Prevented duplicated prefix replay caused by backoff + premature detach interaction |
 | Verification harness | Added stronger mismatch diagnostics (head/tail/context/containment) for `tools/tgstub_e2e` |
 
+## v1.1.13 Run-State Hardening
+
+| Area | Result |
+| --- | --- |
+| Silent long-think runs | If a run is still in flight but tmux briefly shows no visible body, `imcodex` keeps the run busy for a `20m` grace window instead of declaring completion too early |
+| Reconnect during in-flight run | Transient tmux capture/session failures no longer clear the active run state; pending tail output survives reconnect |
+| Recovery bookkeeping | Recovered in-flight runs preserve `busySince`, so long-think protection continues to apply after reconnect instead of expiring immediately |
+| Busy detection | `tmuxctl.IsBusy()` now checks the prompt-adjacent working chrome window instead of depending only on the pane tail layout |
+| Verification | Added regressions for silent runs, capture-failure recovery, grace expiry, and prompt-adjacent busy detection |
+
 ## Problem
 
 | Symptom | Cause |

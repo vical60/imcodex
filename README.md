@@ -211,7 +211,7 @@ If you use `./imcodex.yaml` or `~/.imcodex.yaml`, `-config` is optional:
 Expected startup log:
 
 ```text
-imcodex 1.1.12 started: config=/srv/imcodex/imcodex.yaml platform=lark groups=1 jobs=1 base=https://open.larksuite.com
+imcodex 1.1.13 started: config=/srv/imcodex/imcodex.yaml platform=lark groups=1 jobs=1 base=https://open.larksuite.com
 ```
 
 ## Runtime Behavior
@@ -229,6 +229,8 @@ imcodex 1.1.12 started: config=/srv/imcodex/imcodex.yaml platform=lark groups=1 
 | Boundary capture safety | Before dispatching a new prompt, if boundary capture still shows busy or capture fails, dispatch is deferred so prior tail output is not dropped |
 | Telegram forwarding watchdog | If buffered output or detached queue head stays pending too long, a watchdog forces drain/retry so forwarding cannot stall silently |
 | Tmux capture/session transient failure | Pending buffered output is retained and retried after reconnect before dispatching the next prompt |
+| Silent long-think protection | If a run is still in flight but tmux temporarily shows no visible body, `imcodex` keeps the run busy for a grace window instead of prematurely declaring completion |
+| Busy detection | Busy state is derived from Codex working chrome near the prompt, reducing false idle transitions when the pane footer layout shifts |
 | New message while main session is busy | Interrupts the current run and keeps only the newest pending message by default |
 | Job execution | Posts only the final result, not live incremental output |
 | Restart | Reuses existing `tmux` sessions when they still exist |

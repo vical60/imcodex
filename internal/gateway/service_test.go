@@ -53,6 +53,7 @@ type fakeEditableMessenger struct {
 	events   []string
 	sendErrs []error
 	editErrs []error
+	delErrs  []error
 	edits    int
 }
 
@@ -99,6 +100,27 @@ func (f *fakeEditableMessenger) EditTextInChat(_ context.Context, _ string, mess
 		}
 		f.messages[i].text = text
 		f.events = append(f.events, "edit:"+messageID+":"+text)
+		return nil
+	}
+	return errors.New("message not found")
+}
+
+func (f *fakeEditableMessenger) DeleteMessageInChat(_ context.Context, _ string, messageID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.delErrs) > 0 {
+		err := f.delErrs[0]
+		f.delErrs = f.delErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
+	for i := range f.messages {
+		if f.messages[i].messageID != messageID {
+			continue
+		}
+		f.messages = append(f.messages[:i], f.messages[i+1:]...)
+		f.events = append(f.events, "delete:"+messageID)
 		return nil
 	}
 	return errors.New("message not found")
@@ -1285,6 +1307,44 @@ func TestServiceEditableMessengerBacksOffAfterRateLimit(t *testing.T) {
 	}
 }
 
+func TestServiceSyncEditableOutputPrunesStaleMessagesOnSegmentShrink(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeEditableMessenger{
+		nextID: 3,
+		messages: []trackedMessage{
+			{messageID: "1", text: "seg-1"},
+			{messageID: "2", text: "seg-2"},
+			{messageID: "3", text: "seg-3"},
+		},
+	}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	svc.editRolloverAt = 100
+	rt := &groupRuntime{
+		opts: svc.opts,
+		outputMessages: []trackedMessage{
+			{messageID: "1", text: "seg-1"},
+			{messageID: "2", text: "seg-2"},
+			{messageID: "3", text: "seg-3"},
+		},
+	}
+
+	if err := svc.syncEditableOutput(rt, messenger, "final single segment"); err != nil {
+		t.Fatalf("syncEditableOutput() error = %v", err)
+	}
+
+	if got := len(rt.outputMessages); got != 1 {
+		t.Fatalf("len(outputMessages) = %d, want 1 after shrink", got)
+	}
+	if got := len(messenger.all()); got != 1 {
+		t.Fatalf("len(messages) = %d, want stale segments removed", got)
+	}
+	events := strings.Join(messenger.allEvents(), "\n")
+	if !strings.Contains(events, "delete:2") || !strings.Contains(events, "delete:3") {
+		t.Fatalf("events = %#v, want delete events for stale segments", messenger.allEvents())
+	}
+}
+
 func TestServiceEditableRateLimitBlocksDetachedFlushViaSharedOutputBackoff(t *testing.T) {
 	t.Parallel()
 
@@ -1325,6 +1385,9 @@ func TestServiceEditableRateLimitBlocksDetachedFlushViaSharedOutputBackoff(t *te
 	}
 	if got := len(rt.detachedOutputs); got == 0 {
 		t.Fatalf("len(detachedOutputs) = %d, want queue retained during shared backoff", got)
+	}
+	if !rt.deferBodyUntilIdle {
+		t.Fatal("deferBodyUntilIdle = false, want true after editable 429")
 	}
 }
 
@@ -1432,6 +1495,123 @@ func TestServiceDispatchesNextPromptWhileEditableOutputBackedOff(t *testing.T) {
 	})
 	if got := nonStatusMessages(messenger.all()); len(got) == 0 {
 		t.Fatalf("messages = %#v, want detached first output delivered", got)
+	}
+}
+
+func TestServiceFlushOutputBufferDefersWhileRunInFlightAfterEditableRateLimit(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeEditableMessenger{
+		nextID: 1,
+		messages: []trackedMessage{
+			{messageID: "1", text: "• first"},
+		},
+	}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	rt := &groupRuntime{
+		opts:               svc.opts,
+		runID:              7,
+		nextRunID:          7,
+		outputText:         "• first",
+		outputBuffer:       "\n• second",
+		outputBufferedAt:   time.Now(),
+		editBackoffUntil:   time.Now().Add(time.Minute),
+		deferBodyUntilIdle: true,
+		lastBusy:           true,
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "first",
+		},
+		outputMessages: []trackedMessage{
+			{messageID: "1", text: "• first"},
+		},
+	}
+
+	before := messenger.editCount()
+	svc.flushOutputBuffer(rt)
+	after := messenger.editCount()
+
+	if after != before {
+		t.Fatalf("editCount = %d (before=%d), want no editable flush while run in-flight and deferBodyUntilIdle=true", after, before)
+	}
+	if got := strings.TrimSpace(rt.outputBuffer); got != "• second" {
+		t.Fatalf("outputBuffer = %q, want preserved while deferred", got)
+	}
+}
+
+func TestServiceFlushOutputBufferAllowsIdleFlushAfterEditableRateLimit(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeEditableMessenger{
+		nextID: 1,
+		messages: []trackedMessage{
+			{messageID: "1", text: "• first"},
+		},
+	}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	rt := &groupRuntime{
+		opts:               svc.opts,
+		runID:              7,
+		nextRunID:          7,
+		outputText:         "• first",
+		outputBuffer:       "\n• second",
+		outputBufferedAt:   time.Now(),
+		deferBodyUntilIdle: true,
+		outputMessages: []trackedMessage{
+			{messageID: "1", text: "• first"},
+		},
+	}
+
+	before := messenger.editCount()
+	svc.flushOutputBuffer(rt)
+	after := messenger.editCount()
+
+	if after <= before {
+		t.Fatalf("editCount = %d (before=%d), want editable flush once run is idle", after, before)
+	}
+	if rt.deferBodyUntilIdle {
+		t.Fatal("deferBodyUntilIdle = true, want cleared after successful idle flush")
+	}
+}
+
+func TestServicePollDuringDeferredBodyUntilIdleTracksLatestSnapshotOnly(t *testing.T) {
+	t.Parallel()
+
+	console := &fakeConsole{
+		captures: []string{
+			"• step\n• Working (1s • esc to interrupt)",
+			"• step\n• Running sleep 10\n• Working (2s • esc to interrupt)",
+			"• step\n• Working (3s • esc to interrupt)",
+		},
+	}
+	messenger := &fakeEditableMessenger{}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, console, nil, slog.Default())
+	svc.busyFlushAfter = time.Hour
+	svc.flushIdleTicks = 100
+
+	rt := &groupRuntime{
+		opts:               svc.opts,
+		session:            svc.opts.SessionName,
+		sessionReady:       true,
+		outputArmed:        true,
+		deferBodyUntilIdle: true,
+		editBackoffUntil:   time.Now().Add(time.Minute),
+		lastBusy:           true,
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "first",
+		},
+	}
+
+	svc.poll(rt)
+	svc.poll(rt)
+	svc.poll(rt)
+
+	if got, want := strings.TrimSpace(rt.outputBuffer), "• step"; got != want {
+		t.Fatalf("outputBuffer = %q, want latest rewritten snapshot only %q", got, want)
+	}
+	if strings.Contains(rt.outputBuffer, "Running sleep 10") {
+		t.Fatalf("outputBuffer = %q, want transient rewritten lines dropped", rt.outputBuffer)
 	}
 }
 
@@ -1644,7 +1824,7 @@ func TestServiceFlushOutputBufferRedirectsToDetachedQueueWhenBacklogExists(t *te
 	}
 }
 
-func TestServiceOutputWatchdogDetachesBufferedTailWhenEditBackoffBlocks(t *testing.T) {
+func TestServiceOutputWatchdogKeepsBufferedTailWhenEditBackoffBlocks(t *testing.T) {
 	t.Parallel()
 
 	messenger := &fakeEditableMessenger{}
@@ -1667,15 +1847,52 @@ func TestServiceOutputWatchdogDetachesBufferedTailWhenEditBackoffBlocks(t *testi
 
 	svc.applyOutputWatchdog(rt, time.Now())
 
-	got := nonStatusMessages(messenger.all())
-	if len(got) != 1 || got[0] != "• tail" {
-		t.Fatalf("messages = %#v, want detached tail delivered immediately", got)
+	if !rt.hasBufferedOutput() {
+		t.Fatalf("outputBuffer = %q, want kept while editable backoff is active", rt.outputBuffer)
 	}
-	if rt.hasBufferedOutput() {
-		t.Fatalf("outputBuffer = %q, want emptied by watchdog drain", rt.outputBuffer)
+	if got := len(rt.detachedOutputs); got != 0 {
+		t.Fatalf("len(detachedOutputs) = %d, want 0 while watchdog waits for editable retry", got)
 	}
-	if len(rt.detachedOutputs) != 0 {
-		t.Fatalf("len(detachedOutputs) = %d, want 0 after watchdog flush", len(rt.detachedOutputs))
+	if got := len(nonStatusMessages(messenger.all())); got != 0 {
+		t.Fatalf("messages = %#v, want no detached plain sends while editable backoff is active", messenger.all())
+	}
+}
+
+func TestServiceOutputWatchdogKeepsBufferedTailDuringActiveRunWhenEditBackoffBlocks(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeEditableMessenger{}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	svc.outputWatchdogAfter = 10 * time.Millisecond
+
+	rt := &groupRuntime{
+		opts:             svc.opts,
+		runID:            7,
+		nextRunID:        7,
+		outputText:       "• old",
+		outputBuffer:     "\n\n• tail",
+		outputBufferedAt: time.Now().Add(-time.Second),
+		editBackoffUntil: time.Now().Add(time.Minute),
+		outputMessages: []trackedMessage{
+			{messageID: "1", text: "• old"},
+		},
+		lastBusy: true,
+		active: &activeRequest{
+			messageID: "om_1",
+			input:     "first",
+		},
+	}
+
+	svc.applyOutputWatchdog(rt, time.Now())
+
+	if !rt.hasBufferedOutput() {
+		t.Fatalf("outputBuffer = %q, want kept for editable retry while run is active", rt.outputBuffer)
+	}
+	if got := len(rt.detachedOutputs); got != 0 {
+		t.Fatalf("len(detachedOutputs) = %d, want 0 while active run is in-flight", got)
+	}
+	if got := len(nonStatusMessages(messenger.all())); got != 0 {
+		t.Fatalf("messages = %#v, want no detached plain sends during active run", messenger.all())
 	}
 }
 
@@ -2407,6 +2624,22 @@ func TestServiceResetBufferedOutputIgnoresShrinkingResetWhileRunInFlight(t *test
 	}
 	if got := rt.outputBuffer; got != "" {
 		t.Fatalf("outputBuffer = %q, want unchanged empty buffer", got)
+	}
+}
+
+func TestServiceResetBufferedOutputUnsyncedResetReplacesBufferInsteadOfMerging(t *testing.T) {
+	t.Parallel()
+
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, &fakeMessenger{}, &fakeConsole{}, nil, slog.Default())
+	rt := &groupRuntime{
+		outputBuffer:     "• step1\n• step2",
+		outputBufferedAt: time.Now(),
+	}
+
+	svc.resetBufferedOutput(rt, "• step1 (rewritten)")
+
+	if got, want := rt.outputBuffer, "• step1 (rewritten)"; got != want {
+		t.Fatalf("outputBuffer = %q, want latest rewritten snapshot %q", got, want)
 	}
 }
 

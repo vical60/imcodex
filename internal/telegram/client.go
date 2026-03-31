@@ -132,6 +132,17 @@ func (c *Client) EditTextInChat(ctx context.Context, groupID string, messageID s
 	}, nil)
 }
 
+func (c *Client) DeleteMessageInChat(ctx context.Context, groupID string, messageID string) error {
+	id, err := strconv.ParseInt(strings.TrimSpace(messageID), 10, 64)
+	if err != nil {
+		return fmt.Errorf("telegram message id is invalid: %w", err)
+	}
+	return c.call(ctx, "deleteMessage", map[string]any{
+		"chat_id":    strings.TrimSpace(groupID),
+		"message_id": id,
+	}, nil)
+}
+
 func (c *Client) SendChatAction(ctx context.Context, groupID string, action string) error {
 	if c == nil {
 		return nil

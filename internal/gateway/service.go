@@ -71,6 +71,10 @@ type EditableMessenger interface {
 	EditTextInChat(ctx context.Context, groupID string, messageID string, text string) error
 }
 
+type DeleteMessenger interface {
+	DeleteMessageInChat(ctx context.Context, groupID string, messageID string) error
+}
+
 type ActionMessenger interface {
 	SendChatAction(ctx context.Context, groupID string, action string) error
 }
@@ -143,6 +147,7 @@ type groupRuntime struct {
 	detachedBackoffUntil time.Time
 	detachedRetryCount   int
 	editBackoffUntil     time.Time
+	deferBodyUntilIdle   bool
 	busySince            time.Time
 	workingSent          bool
 	lastActionAt         time.Time
@@ -376,6 +381,7 @@ func (s *Service) ensureSession(rt *groupRuntime) error {
 		rt.detachedBackoffUntil = time.Time{}
 		rt.detachedRetryCount = 0
 		rt.editBackoffUntil = time.Time{}
+		rt.deferBodyUntilIdle = false
 	}
 	rt.outputArmed = recoveringOutput
 	rt.busySince = time.Time{}
@@ -439,6 +445,7 @@ func (s *Service) dispatchNext(rt *groupRuntime) {
 		rt.detachedBackoffUntil = time.Time{}
 		rt.detachedRetryCount = 0
 		rt.editBackoffUntil = time.Time{}
+		rt.deferBodyUntilIdle = false
 		rt.busySince = time.Time{}
 		rt.workingSent = false
 		rt.lastActionAt = time.Time{}
@@ -509,6 +516,7 @@ func (s *Service) dispatchPrepared(rt *groupRuntime, req *activeRequest) error {
 	rt.clearOutputBuffer()
 	rt.outputText = ""
 	rt.editBackoffUntil = time.Time{}
+	rt.deferBodyUntilIdle = false
 	rt.busySince = time.Now()
 	rt.workingSent = false
 	rt.lastActionAt = time.Time{}
@@ -577,7 +585,6 @@ func (s *Service) poll(rt *groupRuntime) {
 	}
 	delta, reset := tmuxctl.DiffText(prevText, currText)
 	busyRaw := tmuxctl.IsBusy(snapshot)
-
 	if busyRaw {
 		rt.idleTicks = 0
 		if rt.outputText == "" {
@@ -609,14 +616,23 @@ func (s *Service) poll(rt *groupRuntime) {
 
 	deferSnapshotCommit := false
 	if rt.outputArmed {
-		if reset {
-			if !s.resetBufferedOutput(rt, currText) {
-				// Keep previous snapshot baseline so deferred reset can be
-				// reconciled on the next poll instead of silently advancing.
-				deferSnapshotCommit = true
-			}
+		if s.shouldDeferBodyFlush(rt, now) {
+			// After editable 429, keep only the latest pane snapshot body while
+			// the run is active. This avoids accumulating transient rewritten
+			// fragments that would become replay-like spam once flushed.
+			currTrimmed := strings.Trim(currText, "\n")
+			rt.outputText = ""
+			rt.replaceOutputBuffer(currTrimmed, now)
 		} else {
-			rt.appendOutputBuffer(delta, now)
+			if reset {
+				if !s.resetBufferedOutput(rt, currText) {
+					// Keep previous snapshot baseline so deferred reset can be
+					// reconciled on the next poll instead of silently advancing.
+					deferSnapshotCommit = true
+				}
+			} else {
+				rt.appendOutputBuffer(delta, now)
+			}
 		}
 		if rt.hasBufferedOutput() {
 			rt.outputBufferedTicks++
@@ -682,7 +698,17 @@ func (s *Service) applyOutputWatchdog(rt *groupRuntime, now time.Time) {
 		"detached_len", len(rt.detachedOutputs),
 	)
 	s.flushOutputBuffer(rt)
+	editable := s.editableMessenger()
 	if rt.hasBufferedOutput() {
+		if editable != nil && len(rt.pending) == 0 &&
+			(s.shouldDeferBodyFlush(rt, now) ||
+				(!rt.editBackoffUntil.IsZero() && rt.editBackoffUntil.After(now)) ||
+				(!rt.outputBackoffUntil.IsZero() && rt.outputBackoffUntil.After(now))) {
+			// Keep buffered body in editable mode while deferred/backing off.
+			// Detaching here can turn transient rewritten snapshots into
+			// duplicated plain messages.
+			return
+		}
 		s.detachBufferedOutput(rt)
 	}
 	s.flushDetachedOutputs(rt)
@@ -723,6 +749,19 @@ func shouldFlushOnSize(rt *groupRuntime, softLimit int, hardLimit int) bool {
 		return false
 	}
 	return utf8.RuneCountInString(candidate) >= limit
+}
+
+func (s *Service) shouldDeferBodyFlush(rt *groupRuntime, now time.Time) bool {
+	if rt == nil || !rt.deferBodyUntilIdle {
+		return false
+	}
+	if !rt.editBackoffUntil.IsZero() && rt.editBackoffUntil.After(now) {
+		return true
+	}
+	if !rt.outputBackoffUntil.IsZero() && rt.outputBackoffUntil.After(now) {
+		return true
+	}
+	return false
 }
 
 func normalizePromptEchoTail(input string) string {
@@ -798,11 +837,10 @@ func (s *Service) resetBufferedOutput(rt *groupRuntime, currText string) bool {
 	if strings.TrimSpace(rt.outputText) == "" && strings.TrimSpace(rt.outputBuffer) != "" {
 		deltaBuf, resetBuf := tmuxctl.DiffText(rt.outputBuffer, currText)
 		if resetBuf {
-			if len(currText) >= len(rt.outputBuffer) {
-				rt.replaceOutputBuffer(currText, time.Now())
-			} else {
-				rt.replaceOutputBuffer(mergeBufferedOutput(rt.outputBuffer, currText), time.Now())
-			}
+			// With no committed baseline yet, a reset means pane content was
+			// rewritten. Keep only the latest snapshot to avoid replaying
+			// transient body fragments that Codex has already replaced.
+			rt.replaceOutputBuffer(currText, time.Now())
 			return true
 		}
 		if strings.TrimSpace(deltaBuf) == "" {
@@ -1198,6 +1236,10 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 		return
 	}
 	now := time.Now()
+	editable := s.editableMessenger()
+	if editable != nil && s.shouldDeferBodyFlush(rt, now) {
+		return
+	}
 	if rt.outputBackoffActive(now) {
 		return
 	}
@@ -1230,7 +1272,6 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 		s.logOutputStateDebug(rt, "flush redirected to detached queue while backlog exists")
 		return
 	}
-	editable := s.editableMessenger()
 	if editable == nil {
 		text := strings.Trim(raw, "\n")
 		if strings.TrimSpace(text) == "" {
@@ -1281,6 +1322,7 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 		if retryAfter := retryAfterFromRateLimitError(err); retryAfter > 0 {
 			rt.editBackoffUntil = time.Now().Add(retryAfter)
 			rt.applyOutputBackoff(retryAfter)
+			rt.deferBodyUntilIdle = true
 			s.logger.Warn(
 				"sync editable output rate-limited",
 				"group_id",
@@ -1312,6 +1354,7 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 		return
 	}
 	rt.outputText = candidateText
+	rt.deferBodyUntilIdle = false
 	s.logOutputStateDebug(rt, "flush editable output committed")
 }
 
@@ -1636,6 +1679,7 @@ func (s *Service) syncEditableOutput(rt *groupRuntime, editable EditableMessenge
 	next := make([]trackedMessage, len(rt.outputMessages))
 	copy(next, rt.outputMessages)
 	if len(next) > len(segments) {
+		s.pruneStaleEditableMessages(rt, editable, next[len(segments):])
 		next = next[:len(segments)]
 	}
 
@@ -1665,6 +1709,34 @@ func (s *Service) syncEditableOutput(rt *groupRuntime, editable EditableMessenge
 
 	rt.outputMessages = next
 	return nil
+}
+
+func (s *Service) pruneStaleEditableMessages(rt *groupRuntime, editable EditableMessenger, stale []trackedMessage) {
+	if rt == nil || editable == nil || len(stale) == 0 {
+		return
+	}
+	deleter, _ := editable.(DeleteMessenger)
+	for _, item := range stale {
+		messageID := strings.TrimSpace(item.messageID)
+		if messageID == "" {
+			continue
+		}
+		if deleter != nil {
+			if err := deleter.DeleteMessageInChat(context.Background(), rt.opts.GroupID, messageID); err == nil {
+				continue
+			}
+		}
+		// Fallback when delete is unavailable/denied: neutralize stale segments
+		// so old long chunks do not remain visible as repeated bodies.
+		if err := editable.EditTextInChat(context.Background(), rt.opts.GroupID, messageID, "…"); err != nil {
+			s.logger.Warn(
+				"prune stale editable message failed",
+				"group_id", rt.opts.GroupID,
+				"message_id", messageID,
+				"err", err,
+			)
+		}
+	}
 }
 
 func splitForEditMessages(text string, softLimit int, hardLimit int) []string {

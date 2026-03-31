@@ -18,6 +18,15 @@
 | Long-output integrity | Added regressions for very long replies, boundary newlines, and busy/idle boundary retries |
 | Scheduler logging safety | Fixed concurrent stdout/stderr-to-combined writer race found by `go test -race` |
 
+## v1.1.12 Stability Follow-Up
+
+| Area | Result |
+| --- | --- |
+| 429 edit backoff behavior | `defer` now applies only during active backoff windows; once backoff expires, editable sync resumes immediately (no wait-for-idle lock) |
+| Watchdog + editable backoff | Output watchdog no longer detaches buffered editable body into plain messages while edit/output backoff is active |
+| Replay risk under 429 | Prevented duplicated prefix replay caused by backoff + premature detach interaction |
+| Verification harness | Added stronger mismatch diagnostics (head/tail/context/containment) for `tools/tgstub_e2e` |
+
 ## Problem
 
 | Symptom | Cause |
@@ -41,7 +50,7 @@
 | Outbound execution model | Use one per-group event loop to serialize all Telegram send/edit/retry operations |
 | Capture/session recovery | Retain buffered body text across transient tmux capture/session failures and retry flush after reconnect |
 | Telegram length limit | When the active message approaches a soft limit, roll over to a new Telegram message |
-| Telegram API 429 | Respect `retry_after`; keep buffered body text and retry edit after backoff |
+| Telegram API 429 | Respect `retry_after`; keep buffered body text, defer only during backoff window, then retry editable sync immediately |
 | Detached send failures | Keep the detached queue head and retry with bounded backoff; do not drop on transient non-429 failures |
 | Watchdog | Force drain if buffered output or detached queue stays pending too long |
 
@@ -87,7 +96,7 @@
 | 9 | If boundary capture still shows busy or capture fails, keep the pending user message queued and retry dispatch on the next loop |
 | 10 | If editable flush cannot complete at the boundary (for example retry-backoff or stale editable message), detach the unsent tail into a plain send queue and continue dispatch without blocking |
 | 11 | Detached chunks carry `(run_id, cursor)` and are retried in order until successful delivery |
-| 12 | If output buffer age exceeds `output_watchdog_after`, force drain; if still blocked, detach and continue |
+| 12 | If output buffer age exceeds `output_watchdog_after`, force drain; in editable-backoff windows keep body buffered (no detach), otherwise detach and continue |
 
 ## Rationale
 
@@ -140,3 +149,22 @@ Current implementation uses internal constants for these values. YAML exposure i
 
 1. Expose `working_after`, `busy_flush_after`, `flush_idle_ticks`, watchdog parameters, and `edit_rollover_at` through YAML if runtime tuning is needed.
 2. Add a small telemetry panel/command for `(group_id, run_id, cursor, buffer_len, detached_len)` to simplify production debugging.
+
+## Real E2E Harness
+
+Use a local Telegram API stub plus a real tmux+Codex session to verify no truncation or replay:
+
+```bash
+go run ./tools/tgstub_e2e \
+  -group-id -5125916641 \
+  -cwd /home/vical/your_project \
+  -session imcodex-your-session \
+  -prompt "请先思考至少90秒且不要输出任何正文；思考完成后仅输出一行：E2E-STUB-CHECK-DONE"
+```
+
+Notes:
+
+1. The harness requires the target tmux session to already exist by default (`-require-existing=true`) and uses the real Codex pane in that session.
+2. The harness injects one inbound Telegram message via `getUpdates`, records all `sendMessage`/`editMessageText` calls from `imcodex`, and compares aggregated forwarded body with tmux final delta.
+3. Exit code is non-zero on mismatch; logs include first diff index, output tails, and the last send/edit events for diagnosis.
+4. 429 stress can be injected with `-send-429`, `-edit-429`, and `-retry-after`.

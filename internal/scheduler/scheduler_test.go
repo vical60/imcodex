@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
@@ -259,6 +260,43 @@ func TestCommandJobPostsFailureWithStageHint(t *testing.T) {
 	}
 	if !strings.Contains(outputs[0], "cache failed") {
 		t.Fatalf("outputs[0] = %q, want stderr tail", outputs[0])
+	}
+}
+
+func TestBufferGroupConcurrentWrite(t *testing.T) {
+	t.Parallel()
+
+	var stdout bytes.Buffer
+	var combined bytes.Buffer
+	writer := multiBufferWriter(&stdout, &combined)
+
+	const workers = 8
+	const writesPerWorker = 200
+
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 0; n < writesPerWorker; n++ {
+				if _, err := writer.Write([]byte("x")); err != nil {
+					t.Errorf("Write() error = %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	want := workers * writesPerWorker
+	if got := stdout.Len(); got != want {
+		t.Fatalf("stdout.Len() = %d, want %d", got, want)
+	}
+	if got := combined.Len(); got != want {
+		t.Fatalf("combined.Len() = %d, want %d", got, want)
+	}
+	if stdout.String() != combined.String() {
+		t.Fatalf("buffer contents diverged:\nstdout=%q\ncombined=%q", stdout.String(), combined.String())
 	}
 }
 

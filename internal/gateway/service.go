@@ -21,7 +21,6 @@ const (
 	maxMessageRunes         = 3000
 	queueSize               = 64
 	recentMessageIDLimit    = 256
-	maxDetachedSendRetries  = 3
 	defaultFlushIdleTicks   = 8
 	defaultWorkingAfter     = time.Second
 	defaultChatActionEvery  = 4 * time.Second
@@ -134,6 +133,7 @@ type groupRuntime struct {
 	idleTicks            int
 	outputBuffer         string
 	outputBufferedAt     time.Time
+	outputBufferedTicks  int
 	outputText           string
 	outputMessages       []trackedMessage
 	detachedOutputs      []detachedOutput
@@ -305,7 +305,7 @@ func (s *Service) runGroup(rt *groupRuntime) {
 		case <-ticker.C:
 			s.flushDetachedOutputs(rt)
 			if !rt.sessionReady {
-				if len(rt.pending) == 0 && !rt.hasBufferedOutput() {
+				if !rt.hasRecoverableOutputState() && len(rt.pending) == 0 {
 					continue
 				}
 				if err := s.ensureSession(rt); err != nil {
@@ -354,8 +354,11 @@ func (s *Service) ensureSession(rt *groupRuntime) error {
 		return err
 	}
 
-	rt.lastText = tmuxctl.NormalizeSnapshot(snapshot)
-	rt.baseText = ""
+	captured := tmuxctl.NormalizeSnapshot(snapshot)
+	if !recoveringOutput {
+		rt.lastText = captured
+		rt.baseText = ""
+	}
 	rt.lastBusy = tmuxctl.IsBusy(snapshot)
 	rt.idleTicks = 0
 	if !recoveringOutput {
@@ -383,10 +386,15 @@ func (s *Service) dispatchNext(rt *groupRuntime) {
 	if len(rt.pending) == 0 {
 		return
 	}
-	s.finalizeOutputBeforeDispatch(rt)
+	if !s.finalizeOutputBeforeDispatch(rt) {
+		return
+	}
 	s.flushOutputBuffer(rt)
 	if rt.hasBufferedOutput() {
 		s.detachBufferedOutput(rt)
+	}
+	if len(rt.pending) == 0 {
+		return
 	}
 
 	msg := rt.pending[0]
@@ -434,37 +442,41 @@ func (s *Service) dispatchNext(rt *groupRuntime) {
 	}
 }
 
-func (s *Service) finalizeOutputBeforeDispatch(rt *groupRuntime) {
+func (s *Service) finalizeOutputBeforeDispatch(rt *groupRuntime) bool {
 	if rt == nil || !rt.sessionReady || strings.TrimSpace(rt.session) == "" {
-		return
+		return true
 	}
-	// Only run boundary finalization when there is existing reply state to reconcile.
-	// This avoids consuming fresh run snapshots before the very first dispatch.
-	if !rt.hasBufferedOutput() && strings.TrimSpace(rt.outputText) == "" && len(rt.outputMessages) == 0 {
-		return
+	// Run boundary finalization whenever output is armed. This catches late tail
+	// output that arrived after the last poll but before the next dispatch.
+	// Keep a fallback for explicit buffered/synced state even if outputArmed is false.
+	if !rt.outputArmed && !rt.hasBufferedOutput() && strings.TrimSpace(rt.outputText) == "" && len(rt.outputMessages) == 0 {
+		return true
 	}
 	snapshot, err := s.console.Capture(s.ctx, rt.session, s.history)
 	if err != nil {
 		s.logger.Warn("capture finalize output failed", "group_id", rt.opts.GroupID, "session", rt.session, "err", err)
-		return
+		return false
 	}
 	currFullText := tmuxctl.NormalizeSnapshot(snapshot)
 	rt.lastText = currFullText
 	if tmuxctl.IsBusy(snapshot) {
-		return
+		rt.lastBusy = true
+		rt.idleTicks = 0
+		return false
 	}
 	currText := tmuxctl.SliceAfter(rt.baseText, currFullText)
 	currText = strings.Trim(currText, "\n")
 	if strings.TrimSpace(currText) == "" {
-		return
+		return true
 	}
 	knownText := mergeBufferedOutput(rt.outputText, rt.outputBuffer)
 	delta, reset := tmuxctl.DiffText(knownText, currText)
 	if reset {
 		s.resetBufferedOutput(rt, currText)
-		return
+		return true
 	}
 	rt.appendOutputBuffer(delta, time.Now())
+	return true
 }
 
 func (s *Service) dispatchPrepared(rt *groupRuntime, req *activeRequest) error {
@@ -526,10 +538,12 @@ func (s *Service) poll(rt *groupRuntime) {
 	if err != nil {
 		s.logger.Warn("capture tmux pane failed", "group_id", rt.opts.GroupID, "session", rt.session, "err", err)
 		rt.sessionReady = false
-		rt.baseText = ""
 		rt.lastBusy = false
 		rt.idleTicks = 0
-		rt.lastText = ""
+		if !rt.hasRecoverableOutputState() {
+			rt.baseText = ""
+			rt.lastText = ""
+		}
 		rt.busySince = time.Time{}
 		rt.workingSent = false
 		rt.lastActionAt = time.Time{}
@@ -577,15 +591,21 @@ func (s *Service) poll(rt *groupRuntime) {
 	}
 
 	if rt.outputArmed {
-		rt.appendOutputBuffer(delta, now)
 		if reset {
 			s.resetBufferedOutput(rt, currText)
+		} else {
+			rt.appendOutputBuffer(delta, now)
+		}
+		if rt.hasBufferedOutput() {
+			rt.outputBufferedTicks++
+		} else {
+			rt.outputBufferedTicks = 0
 		}
 		if shouldFlushOnSize(rt, s.editRolloverAt, maxMessageRunes) {
 			s.flushOutputBuffer(rt)
 		} else if becameIdle && strings.TrimSpace(rt.outputBuffer) != "" && s.editableMessenger() != nil {
 			s.flushOutputBuffer(rt)
-		} else if shouldFlush(rt.outputBuffer, rt.outputBufferedAt, busy, rt.idleTicks, s.flushIdleTicks, s.busyFlushAfter, now) {
+		} else if shouldFlush(rt.outputBuffer, rt.outputBufferedAt, rt.outputBufferedTicks, s.flushIdleTicks, s.busyFlushAfter, now) {
 			s.flushOutputBuffer(rt)
 		}
 		s.applyOutputWatchdog(rt, now)
@@ -644,17 +664,23 @@ func (s *Service) applyOutputWatchdog(rt *groupRuntime, now time.Time) {
 	s.flushDetachedOutputs(rt)
 }
 
-func shouldFlush(buffer string, bufferedAt time.Time, busy bool, idleTicks int, flushIdleTicks int, busyFlushAfter time.Duration, now time.Time) bool {
+func shouldFlush(buffer string, bufferedAt time.Time, bufferedTicks int, flushIdleTicks int, flushAfter time.Duration, now time.Time) bool {
 	if strings.TrimSpace(buffer) == "" {
 		return false
-	}
-	if busy {
-		return !bufferedAt.IsZero() && busyFlushAfter > 0 && now.Sub(bufferedAt) >= busyFlushAfter
 	}
 	if flushIdleTicks <= 0 {
 		flushIdleTicks = 1
 	}
-	return idleTicks >= flushIdleTicks
+	if bufferedTicks >= flushIdleTicks {
+		return true
+	}
+	if bufferedAt.IsZero() {
+		return false
+	}
+	if flushAfter <= 0 {
+		flushAfter = 500 * time.Millisecond
+	}
+	return now.Sub(bufferedAt) >= flushAfter
 }
 
 func shouldFlushOnSize(rt *groupRuntime, softLimit int, hardLimit int) bool {
@@ -744,7 +770,10 @@ func (s *Service) resetBufferedOutput(rt *groupRuntime, currText string) {
 		rt.replaceOutputBuffer(mergeBufferedOutput(rt.outputBuffer, currText), time.Now())
 		return
 	}
-	rt.replaceOutputBuffer(delta, time.Now())
+	if strings.TrimSpace(delta) == "" {
+		return
+	}
+	rt.replaceOutputBuffer(mergeBufferedOutput(rt.outputBuffer, delta), time.Now())
 }
 
 func (s *Service) enqueuePending(rt *groupRuntime, msg IncomingMessage) {
@@ -1148,7 +1177,6 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 			return
 		}
 		rt.outputText = mergeBufferedOutput(rt.outputText, raw)
-		rt.commitCursor(runID, rt.nextCursor(runID))
 		s.logOutputStateDebug(rt, "flush plain output committed")
 		return
 	}
@@ -1209,7 +1237,6 @@ func (s *Service) flushOutputBuffer(rt *groupRuntime) {
 		return
 	}
 	rt.outputText = candidateText
-	rt.commitCursor(runID, rt.nextCursor(runID))
 	s.logOutputStateDebug(rt, "flush editable output committed")
 }
 
@@ -1253,20 +1280,20 @@ func mergeBufferedOutput(existing string, delta string) string {
 	if strings.HasSuffix(existing, delta) {
 		return existing
 	}
-	if overlap := suffixPrefixOverlap(existing, delta); usableMergeOverlap(delta, overlap) {
+	if overlap := suffixPrefixOverlap(existing, delta); usableMergeOverlap(existing, delta, overlap) {
 		return existing + delta[overlap:]
 	}
 	return existing + delta
 }
 
-func usableMergeOverlap(delta string, overlap int) bool {
-	if overlap <= 0 || overlap > len(delta) {
+func usableMergeOverlap(existing string, delta string, overlap int) bool {
+	if overlap < 8 || overlap > len(delta) || overlap > len(existing) {
 		return false
 	}
-	if overlap >= 8 {
-		return true
-	}
-	return strings.Contains(delta[:overlap], "\n")
+	prevStart := len(existing) - overlap
+	prevBoundary := prevStart == 0 || existing[prevStart-1] == '\n'
+	currBoundary := overlap == len(delta) || delta[overlap] == '\n'
+	return prevBoundary && currBoundary
 }
 
 func suffixPrefixOverlap(prev string, curr string) int {
@@ -1360,6 +1387,7 @@ func (rt *groupRuntime) clearOutputBuffer() {
 	}
 	rt.outputBuffer = ""
 	rt.outputBufferedAt = time.Time{}
+	rt.outputBufferedTicks = 0
 }
 
 func (rt *groupRuntime) hasBufferedOutput() bool {
@@ -1367,6 +1395,20 @@ func (rt *groupRuntime) hasBufferedOutput() bool {
 		return false
 	}
 	return strings.TrimSpace(rt.outputBuffer) != ""
+}
+
+func (rt *groupRuntime) hasRecoverableOutputState() bool {
+	if rt == nil {
+		return false
+	}
+	return rt.outputArmed ||
+		rt.hasBufferedOutput() ||
+		strings.TrimSpace(rt.outputText) != "" ||
+		len(rt.outputMessages) > 0 ||
+		len(rt.detachedOutputs) > 0 ||
+		rt.promptEchoPending ||
+		!rt.detachedBackoffUntil.IsZero() ||
+		!rt.editBackoffUntil.IsZero()
 }
 
 func (rt *groupRuntime) enqueueDetachedOutput(runID uint64, text string) {
@@ -1385,8 +1427,7 @@ func (rt *groupRuntime) enqueueDetachedOutput(runID uint64, text string) {
 		}
 	}
 	for _, chunk := range splitByRunes(text, maxMessageRunes) {
-		chunk = strings.Trim(chunk, "\n")
-		if strings.TrimSpace(chunk) == "" {
+		if chunk == "" {
 			continue
 		}
 		cursor++
@@ -1423,10 +1464,6 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 
 	for len(rt.detachedOutputs) > 0 {
 		item := rt.detachedOutputs[0]
-		if item.cursor <= rt.runCursor(item.runID) {
-			rt.detachedOutputs = rt.detachedOutputs[1:]
-			continue
-		}
 		if err := s.messenger.SendTextToChat(context.Background(), rt.opts.GroupID, item.text); err != nil {
 			retryAfter := retryAfterFromRateLimitError(err)
 			if retryAfter > 0 {
@@ -1450,27 +1487,10 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 				return
 			}
 			rt.detachedRetryCount++
-			if rt.detachedRetryCount >= maxDetachedSendRetries {
-				s.logger.Error(
-					"drop detached output chunk after retries",
-					"group_id",
-					rt.opts.GroupID,
-					"run_id",
-					item.runID,
-					"cursor",
-					item.cursor,
-					"attempts",
-					rt.detachedRetryCount,
-					"err",
-					err,
-				)
-				s.sendBestEffort(rt.opts.GroupID, fmt.Sprintf("Failed to deliver buffered output chunk after %d attempts: %v", rt.detachedRetryCount, err))
-				rt.detachedOutputs = rt.detachedOutputs[1:]
-				rt.detachedBackoffUntil = time.Time{}
-				rt.detachedRetryCount = 0
-				continue
-			}
 			retryAfter = time.Duration(rt.detachedRetryCount) * time.Second
+			if retryAfter > 30*time.Second {
+				retryAfter = 30 * time.Second
+			}
 			rt.detachedBackoffUntil = time.Now().Add(retryAfter)
 			s.logger.Warn(
 				"flush detached output failed",
@@ -1486,6 +1506,8 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 				retryAfter.String(),
 				"retry_at",
 				rt.detachedBackoffUntil,
+				"queue_len",
+				len(rt.detachedOutputs),
 				"err",
 				err,
 			)
@@ -1493,7 +1515,6 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 		}
 		rt.detachedOutputs = rt.detachedOutputs[1:]
 		rt.detachedRetryCount = 0
-		rt.commitCursor(item.runID, item.cursor)
 		s.logOutputStateDebug(rt, "detached output committed")
 	}
 }

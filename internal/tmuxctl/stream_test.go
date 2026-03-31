@@ -75,6 +75,21 @@ func TestDiffTextTreatsTinyOverlapAsReset(t *testing.T) {
 	}
 }
 
+func TestDiffTextTreatsShortRepeatedOverlapAsReset(t *testing.T) {
+	t.Parallel()
+
+	prev := "0123456789abcdef-shared-tail"
+	curr := "shared-tail-new-content"
+
+	delta, reset := DiffText(prev, curr)
+	if !reset {
+		t.Fatal("reset = false, want true for short overlap to avoid tail loss")
+	}
+	if got, want := delta, curr; got != want {
+		t.Fatalf("delta = %q, want %q", got, want)
+	}
+}
+
 func TestIsBusyHandlesTrailingPromptPlaceholder(t *testing.T) {
 	t.Parallel()
 

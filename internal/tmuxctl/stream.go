@@ -49,17 +49,25 @@ func DiffText(prev string, curr string) (string, bool) {
 	if strings.HasPrefix(curr, prev) {
 		return curr[len(prev):], false
 	}
-	if overlap := suffixPrefixOverlap(prev, curr); hasUsableOverlap(overlap) {
+	if overlap := suffixPrefixOverlap(prev, curr); hasUsableOverlap(prev, curr, overlap) {
 		return curr[overlap:], false
 	}
 	return curr, true
 }
 
-func hasUsableOverlap(overlap int) bool {
+func hasUsableOverlap(prev string, curr string, overlap int) bool {
 	// Tiny accidental overlaps (for example one shared punctuation mark)
-	// can incorrectly classify a reset as append-only and cause repeated text.
+	// can incorrectly classify a reset as append-only and drop fresh output.
 	const minStableOverlap = 8
-	return overlap >= minStableOverlap
+	if overlap < minStableOverlap || overlap > len(prev) || overlap > len(curr) {
+		return false
+	}
+	// Only trust overlaps aligned to whole-line boundaries. This keeps
+	// pane-scroll dedupe while avoiding accidental mid-token truncation.
+	prevStart := len(prev) - overlap
+	prevBoundary := prevStart == 0 || prev[prevStart-1] == '\n'
+	currBoundary := overlap == len(curr) || curr[overlap] == '\n'
+	return prevBoundary && currBoundary
 }
 
 func SliceAfter(base string, curr string) string {

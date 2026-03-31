@@ -211,7 +211,7 @@ If you use `./imcodex.yaml` or `~/.imcodex.yaml`, `-config` is optional:
 Expected startup log:
 
 ```text
-imcodex 1.1.9 started: config=/srv/imcodex/imcodex.yaml platform=lark groups=1 jobs=1 base=https://open.larksuite.com
+imcodex 1.1.10 started: config=/srv/imcodex/imcodex.yaml platform=lark groups=1 jobs=1 base=https://open.larksuite.com
 ```
 
 ## Runtime Behavior
@@ -224,8 +224,9 @@ imcodex 1.1.9 started: config=/srv/imcodex/imcodex.yaml platform=lark groups=1 j
 | Images / files | Downloaded into `cwd/.imcodex/inbox/`, then forwarded as a short text prompt with the saved path |
 | Telegram live output | Sends periodic typing actions while the first visible reply is pending, posts one early working status, then edits an active message after a short idle debounce |
 | Telegram edit rate limit | If Telegram returns `429` on `editMessageText`, buffered text is preserved and retried after `retry_after` backoff |
-| Telegram forwarding identity | Each Codex run is tracked by `(run_id, cursor)`; cursor advances only after successful Telegram send/edit to prevent replay and silent drops |
+| Telegram forwarding identity | Each Codex run is tracked by `(run_id, cursor)` for ordering and debug telemetry |
 | New prompt while prior tail is blocked on edit/backoff | New prompt dispatch proceeds immediately; unsent prior tail is detached to an internal send queue and delivered asynchronously |
+| Boundary capture safety | Before dispatching a new prompt, if boundary capture still shows busy or capture fails, dispatch is deferred so prior tail output is not dropped |
 | Telegram forwarding watchdog | If buffered output or detached queue head stays pending too long, a watchdog forces drain/retry so forwarding cannot stall silently |
 | Tmux capture/session transient failure | Pending buffered output is retained and retried after reconnect before dispatching the next prompt |
 | New message while main session is busy | Interrupts the current run and keeps only the newest pending message by default |

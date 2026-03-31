@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -334,7 +335,7 @@ func (j *jobRunner) executeCommand(ctx context.Context, runFiles commandRunFiles
 
 	var stdoutBuf bytes.Buffer
 	var stderrBuf bytes.Buffer
-	var combinedBuf bytes.Buffer
+	var combinedBuf lockedBuffer
 	cmd.Stdout = multiBufferWriter(&combinedBuf, &stdoutBuf)
 	cmd.Stderr = multiBufferWriter(&combinedBuf, &stderrBuf)
 	err := cmd.Run()
@@ -502,22 +503,43 @@ func detectStageHint(output string) string {
 	return ""
 }
 
-func multiBufferWriter(buffers ...*bytes.Buffer) *bufferGroup {
-	return &bufferGroup{buffers: buffers}
+func multiBufferWriter(writers ...io.Writer) *bufferGroup {
+	return &bufferGroup{writers: writers}
 }
 
 type bufferGroup struct {
-	buffers []*bytes.Buffer
+	mu      sync.Mutex
+	writers []io.Writer
 }
 
 func (g *bufferGroup) Write(p []byte) (int, error) {
-	for _, buf := range g.buffers {
-		if buf == nil {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+
+	for _, writer := range g.writers {
+		if writer == nil {
 			continue
 		}
-		if _, err := buf.Write(p); err != nil {
+		if _, err := writer.Write(p); err != nil {
 			return 0, err
 		}
 	}
 	return len(p), nil
+}
+
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }

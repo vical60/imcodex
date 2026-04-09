@@ -7,6 +7,8 @@
 #   ./imcodex -config /srv/imcodex/imcodex.yaml --runtime host-codex
 # Optional Docker Codex config dir override:
 #   ./imcodex -config /srv/imcodex/imcodex.yaml --codex-config-dir ~/.codex
+# Optional Docker image override for docker-codex:
+# docker_image: ghcr.io/acme/imcodex-go:1.24
 
 # Platform defaults to lark when omitted.
 platform: lark

@@ -24,6 +24,7 @@ The older runtime surface had three practical problems:
 - one `imcodex` binary
 - one embedded Docker launcher
 - one local stable image tag: `imcodex-codex:stable`
+- optional custom prebuilt images via `docker_image`
 
 ## Runtime Flow
 
@@ -36,6 +37,12 @@ For `docker-codex`:
 5. Docker starts Codex with only the configured group `cwd` mounted as `/workspace`.
 6. The host Codex config directory is copied into container-local `/home/agent/.codex`.
 7. Codex runs inside the container and the TUI remains visible in the host tmux pane.
+
+If `docker_image` is set in YAML:
+
+1. `imcodex` skips the managed-image rebuild check.
+2. Docker runs the provided image directly.
+3. The same workspace mount and Codex config copy behavior still applies.
 
 For `host-codex`:
 
@@ -72,7 +79,7 @@ Replacement startup flags:
 
 ## Stable Codex Version
 
-The Docker runtime for `v2.2.0` pins Codex CLI `0.118.0`.
+The Docker runtime for `v2.2.1` pins Codex CLI `0.118.0`.
 
 That version is baked into the local `stable` image build. This avoids live
 interactive upgrade prompts during production traffic.

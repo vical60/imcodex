@@ -2,7 +2,7 @@
 
 ## Status
 
-Current behavior for `v2.2.2`. This document describes what ships today, not a
+Current behavior for `v2.2.3`. This document describes what ships today, not a
 future proposal.
 
 ## Goals
@@ -20,6 +20,8 @@ future proposal.
   them.
 - Body updates respect the normal `editableSyncEvery` cadence, including the
   busy-to-idle transition.
+- Repeated or severe editable `429` responses switch body delivery to detached
+  queued chunks instead of indefinitely retrying the same editable body.
 - A short `[working]` status message may appear first and is cleaned up
   independently from body delivery.
 
@@ -38,8 +40,9 @@ future proposal.
 - Telegram `retry_after` is honored
 - a detached `429` blocks editable sends during the same backoff window
 - an editable `429` blocks detached sends during the same backoff window
+- delivery tracing logs why buffered output is deferred, blocked, or committed
 
-## Behaviors Removed In `v2.2.2`
+## Behaviors Removed In `v2.2.3`
 
 - detached backlog drain loops that send many chunks immediately after a retry
   window

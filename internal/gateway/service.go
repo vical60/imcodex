@@ -31,9 +31,13 @@ const (
 	defaultWatchdogDetachAfter = 30 * time.Second
 	defaultEditRolloverAt      = 2800
 	defaultEditableSyncEvery   = 5 * time.Second
-	defaultDetachedSendEvery   = time.Second
+	defaultDetachedSendEvery   = 3 * time.Second
 	defaultDeliveryTimeout     = 20 * time.Second
 	defaultSilentBusyGrace     = 20 * time.Minute
+	outputWatchdogLogEvery     = 5 * time.Second
+	outputTraceLogEvery        = 5 * time.Second
+	severeEditRetryAfter       = 30 * time.Second
+	repeatedEditRetryAfter     = 10 * time.Second
 	workingStatusText          = "[working] Codex is processing."
 )
 
@@ -152,6 +156,9 @@ type groupRuntime struct {
 	outputBuffer         string
 	outputBufferedAt     time.Time
 	outputBufferedTicks  int
+	lastOutputWatchdogAt time.Time
+	lastOutputTraceAt    time.Time
+	lastOutputTraceKey   string
 	outputText           string
 	outputMessages       []trackedMessage
 	statusMessage        trackedMessage
@@ -644,8 +651,29 @@ func (s *Service) poll(rt *groupRuntime) {
 	}
 	delta, reset := tmuxctl.DiffText(prevText, currText)
 	busyRaw := tmuxctl.IsBusy(snapshot)
+	heldSilentBusy := false
 	if !busyRaw && s.shouldHoldBusyForSilentRun(rt, currText, now) {
 		busyRaw = true
+		heldSilentBusy = true
+	}
+	if rt.outputArmed && (strings.TrimSpace(delta) != "" || reset || heldSilentBusy) {
+		s.logOutputTrace(
+			rt,
+			"poll observed output",
+			now,
+			"prev_len",
+			utf8.RuneCountInString(strings.Trim(prevText, "\n")),
+			"curr_len",
+			utf8.RuneCountInString(strings.Trim(currText, "\n")),
+			"delta_len",
+			utf8.RuneCountInString(strings.Trim(delta, "\n")),
+			"reset",
+			reset,
+			"busy_raw",
+			busyRaw,
+			"held_silent_busy",
+			heldSilentBusy,
+		)
 	}
 	if busyRaw {
 		rt.idleTicks = 0
@@ -751,15 +779,18 @@ func (s *Service) applyOutputWatchdog(rt *groupRuntime, now time.Time) {
 	if age < s.outputWatchdogAfter {
 		return
 	}
-	s.logger.Warn(
-		"output watchdog forcing drain",
-		"group_id", rt.opts.GroupID,
-		"run_id", rt.runID,
-		"cursor", rt.runCursor(rt.runID),
-		"age", age.String(),
-		"buffer_len", utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
-		"detached_len", len(rt.detachedOutputs),
-	)
+	if rt.lastOutputWatchdogAt.IsZero() || now.Sub(rt.lastOutputWatchdogAt) >= outputWatchdogLogEvery {
+		s.logger.Warn(
+			"output watchdog forcing drain",
+			"group_id", rt.opts.GroupID,
+			"run_id", rt.runID,
+			"cursor", rt.runCursor(rt.runID),
+			"age", age.String(),
+			"buffer_len", utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
+			"detached_len", len(rt.detachedOutputs),
+		)
+		rt.lastOutputWatchdogAt = now
+	}
 	s.flushOutputBuffer(rt)
 	editable := s.editableMessenger()
 	if editable != nil {
@@ -1447,18 +1478,60 @@ func (s *Service) flushOutputBufferMode(rt *groupRuntime, forceEditable bool) {
 		editable = nil
 	}
 	if editable != nil && s.shouldDeferBodyFlush(rt, now) {
+		s.logOutputTrace(
+			rt,
+			"flush deferred while editable backoff active",
+			now,
+			"buffer_len",
+			utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
+			"output_backoff_until",
+			rt.outputBackoffUntil,
+			"edit_backoff_until",
+			rt.editBackoffUntil,
+			"defer_body_until_idle",
+			rt.deferBodyUntilIdle,
+		)
 		return
 	}
 	if rt.outputBackoffActive(now) {
+		s.logOutputTrace(
+			rt,
+			"flush blocked by shared output backoff",
+			now,
+			"buffer_len",
+			utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
+			"output_backoff_until",
+			rt.outputBackoffUntil,
+		)
 		return
 	}
 	if editable != nil && !rt.editBackoffUntil.IsZero() {
 		if rt.editBackoffUntil.After(now) {
+			s.logOutputTrace(
+				rt,
+				"flush waiting for editable retry window",
+				now,
+				"buffer_len",
+				utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
+				"edit_backoff_until",
+				rt.editBackoffUntil,
+			)
 			return
 		}
 		rt.editBackoffUntil = time.Time{}
 	}
 	if editable != nil && len(rt.detachedOutputs) == 0 && !s.canSyncEditableOutput(rt, now, forceEditable) {
+		s.logOutputTrace(
+			rt,
+			"flush waiting for editable sync cadence",
+			now,
+			"buffer_len",
+			utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
+			"last_editable_sync_at",
+			rt.lastEditableSyncAt,
+			"sync_every",
+			s.editableSyncEvery,
+		)
 		return
 	}
 	raw := rt.outputBuffer
@@ -1543,6 +1616,26 @@ func (s *Service) flushOutputBufferMode(rt *groupRuntime, forceEditable bool) {
 				"err",
 				err,
 			)
+			if shouldFallbackFromEditableRateLimit(rt, retryAfter) {
+				rt.forcePlainOutput = true
+				rt.deferBodyUntilIdle = false
+				s.detachBufferedOutput(rt)
+				s.logger.Warn(
+					"sync editable output switched to detached queue",
+					"group_id",
+					rt.opts.GroupID,
+					"run_id",
+					runID,
+					"cursor",
+					rt.runCursor(runID),
+					"retry_after",
+					retryAfter.String(),
+					"rate_limit_count",
+					rt.editRateLimitCount,
+					"queue_len",
+					len(rt.detachedOutputs),
+				)
+			}
 			return
 		}
 		s.logger.Error(
@@ -1563,6 +1656,15 @@ func (s *Service) flushOutputBufferMode(rt *groupRuntime, forceEditable bool) {
 	rt.lastEditableSyncAt = now
 	rt.deferBodyUntilIdle = false
 	rt.forcePlainOutput = false
+	s.logOutputTrace(
+		rt,
+		"editable output committed",
+		now,
+		"published_len",
+		utf8.RuneCountInString(desiredText),
+		"segments",
+		len(splitForEditMessages(desiredText, s.editRolloverAt, maxMessageRunes)),
+	)
 	s.logOutputStateDebug(rt, "flush editable output committed")
 }
 
@@ -1683,6 +1785,16 @@ func parseLeadingInt(text string) int {
 	return n
 }
 
+func shouldFallbackFromEditableRateLimit(rt *groupRuntime, retryAfter time.Duration) bool {
+	if rt == nil || retryAfter <= 0 {
+		return false
+	}
+	if retryAfter >= severeEditRetryAfter {
+		return true
+	}
+	return rt.editRateLimitCount >= 2 && retryAfter >= repeatedEditRetryAfter
+}
+
 func (rt *groupRuntime) appendOutputBuffer(delta string, now time.Time) {
 	if rt == nil || delta == "" {
 		return
@@ -1714,6 +1826,7 @@ func (rt *groupRuntime) clearOutputBuffer() {
 	rt.outputBuffer = ""
 	rt.outputBufferedAt = time.Time{}
 	rt.outputBufferedTicks = 0
+	rt.lastOutputWatchdogAt = time.Time{}
 }
 
 func (rt *groupRuntime) hasBufferedOutput() bool {
@@ -1905,6 +2018,15 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 	}
 	now := time.Now()
 	if rt.outputBackoffActive(now) {
+		s.logOutputTrace(
+			rt,
+			"detached flush blocked by shared output backoff",
+			now,
+			"queue_len",
+			len(rt.detachedOutputs),
+			"output_backoff_until",
+			rt.outputBackoffUntil,
+		)
 		return
 	}
 	if s.detachedWatchdogAfter > 0 && !rt.detachedOutputs[0].enqueuedAt.IsZero() && now.Sub(rt.detachedOutputs[0].enqueuedAt) >= s.detachedWatchdogAfter {
@@ -1918,11 +2040,29 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 	}
 	if !rt.detachedBackoffUntil.IsZero() {
 		if rt.detachedBackoffUntil.After(now) {
+			s.logOutputTrace(
+				rt,
+				"detached flush waiting for retry window",
+				now,
+				"queue_len",
+				len(rt.detachedOutputs),
+				"detached_backoff_until",
+				rt.detachedBackoffUntil,
+			)
 			return
 		}
 		rt.detachedBackoffUntil = time.Time{}
 	}
 	if !rt.nextDetachedSendAt.IsZero() && rt.nextDetachedSendAt.After(now) {
+		s.logOutputTrace(
+			rt,
+			"detached flush waiting for per-chat spacing",
+			now,
+			"queue_len",
+			len(rt.detachedOutputs),
+			"next_detached_send_at",
+			rt.nextDetachedSendAt,
+		)
 		return
 	}
 
@@ -1985,6 +2125,17 @@ func (s *Service) flushDetachedOutputs(rt *groupRuntime) {
 	} else {
 		rt.nextDetachedSendAt = time.Time{}
 	}
+	s.logOutputTrace(
+		rt,
+		"detached output committed",
+		time.Now(),
+		"item_len",
+		utf8.RuneCountInString(item.text),
+		"remaining_queue_len",
+		len(rt.detachedOutputs),
+		"next_detached_send_at",
+		rt.nextDetachedSendAt,
+	)
 	s.logOutputStateDebug(rt, "detached output committed")
 	if !rt.runInFlight() && !rt.hasPendingOutputDelivery() {
 		s.clearWorkingStatus(rt)
@@ -2231,6 +2382,33 @@ func (s *Service) logOutputStateDebug(rt *groupRuntime, message string) {
 		"buffer_len", utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
 		"detached_len", len(rt.detachedOutputs),
 	)
+}
+
+func (s *Service) logOutputTrace(rt *groupRuntime, message string, now time.Time, attrs ...any) {
+	if rt == nil {
+		return
+	}
+	if now.IsZero() {
+		now = time.Now()
+	}
+	if rt.lastOutputTraceKey == message && !rt.lastOutputTraceAt.IsZero() && now.Sub(rt.lastOutputTraceAt) < outputTraceLogEvery {
+		return
+	}
+	rt.lastOutputTraceKey = message
+	rt.lastOutputTraceAt = now
+
+	base := []any{
+		"group_id", rt.opts.GroupID,
+		"run_id", rt.runID,
+		"busy", rt.lastBusy,
+		"idle_ticks", rt.idleTicks,
+		"cursor", rt.runCursor(rt.runID),
+		"buffer_len", utf8.RuneCountInString(strings.Trim(rt.outputBuffer, "\n")),
+		"published_len", utf8.RuneCountInString(strings.Trim(rt.outputText, "\n")),
+		"detached_len", len(rt.detachedOutputs),
+	}
+	base = append(base, attrs...)
+	s.logger.Info(message, base...)
 }
 
 func splitByRunes(text string, limit int) []string {

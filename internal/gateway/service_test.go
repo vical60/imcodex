@@ -2483,6 +2483,56 @@ func TestServiceRetainsEditableStrategyAfterRepeatedEditableRateLimits(t *testin
 	}
 }
 
+func TestServiceFallsBackToDetachedAfterSevereEditableRateLimit(t *testing.T) {
+	t.Parallel()
+
+	messenger := &fakeEditableMessenger{
+		messages: []trackedMessage{
+			{messageID: "1", text: "• synced"},
+		},
+		editErrs: []error{
+			errors.New("telegram api failed: http=429 code=429 desc=Too Many Requests: retry after 38 retry_after=38"),
+		},
+	}
+	svc := NewService(context.Background(), Options{GroupID: "oc_1", CWD: "/srv/demo", SessionName: "imcodex-demo"}, messenger, &fakeConsole{}, nil, slog.Default())
+	svc.editableSyncEvery = 5 * time.Millisecond
+	svc.detachedSendEvery = 0
+	rt := &groupRuntime{
+		opts:             svc.opts,
+		runID:            10,
+		nextRunID:        10,
+		outputText:       "• synced",
+		outputBuffer:     "\n• detached tail",
+		outputBufferedAt: time.Now(),
+		outputMessages: []trackedMessage{
+			{messageID: "1", text: "• synced"},
+		},
+	}
+
+	svc.flushOutputBuffer(rt)
+
+	if !rt.forcePlainOutput {
+		t.Fatal("forcePlainOutput = false, want severe editable 429 to switch strategy")
+	}
+	if rt.deferBodyUntilIdle {
+		t.Fatal("deferBodyUntilIdle = true, want detached fallback to clear editable deferral")
+	}
+	if got := len(rt.detachedOutputs); got != 1 {
+		t.Fatalf("len(detachedOutputs) = %d, want 1 queued detached tail", got)
+	}
+	if rt.hasBufferedOutput() {
+		t.Fatalf("outputBuffer = %q, want tail moved into detached queue", rt.outputBuffer)
+	}
+
+	rt.outputBackoffUntil = time.Time{}
+	svc.flushDetachedOutputs(rt)
+
+	got := nonStatusMessages(messenger.all())
+	if len(got) != 2 || got[0] != "• synced" || got[1] != "• detached tail" {
+		t.Fatalf("messages = %#v, want existing editable body preserved plus detached tail delivery", got)
+	}
+}
+
 func TestServiceDispatchNextDrainsBufferedTailBeforeRunSwitchEvenDuringEditBackoff(t *testing.T) {
 	t.Parallel()
 

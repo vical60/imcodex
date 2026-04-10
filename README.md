@@ -158,14 +158,14 @@ When `imcodex` runs in `docker-codex` mode:
 codex -a never -s danger-full-access --no-alt-screen -C /workspace
 ```
 
-The pinned Docker Codex CLI version for `v2.2.2` is `0.118.0`.
+The pinned Docker Codex CLI version for `v2.2.3` is `0.118.0`.
 
 If you want to prebuild the same image manually:
 
 ```bash
 docker build \
   --build-arg CODEX_VERSION=0.118.0 \
-  --build-arg IMCODEX_IMAGE_REVISION=2.2.2 \
+  --build-arg IMCODEX_IMAGE_REVISION=2.2.3 \
   -t imcodex-codex:stable \
   -f tools/runtime/Dockerfile.codex .
 ```
@@ -202,18 +202,22 @@ and `tmux` session reuse continue to work the same way.
 
 ## Message Delivery
 
-`v2.2.2` keeps host runtime as the default and also tightens Telegram delivery
+`v2.2.3` keeps host runtime as the default and further hardens Telegram delivery
 behavior without changing the public config
 surface:
 
 - outbound send/edit/delete/chat-action calls now use bounded request timeouts
 - detached reply chunks resume one at a time with per-chat spacing instead of
   draining the whole backlog at once
+- severe editable `429` responses fall back to detached delivery instead of
+  retrying the same editable body indefinitely
 - editable reply sync no longer bypasses the normal edit throttle on every
   busy-to-idle transition
 - watchdog retries no longer rewrite an editable body into plain detached body
   sends
 - recovery after `429` no longer depends on a later unrelated inbound message
+- delivery tracing now logs why buffered output is waiting, blocked, or
+  committed
 
 Current operator-facing behavior is documented in
 [docs/telegram-output-buffering.md](docs/telegram-output-buffering.md).
@@ -233,5 +237,5 @@ More detailed runtime notes:
 ## Example Startup Log
 
 ```text
-imcodex 2.2.2 started: config=/srv/imcodex/imcodex.yaml platform=telegram runtime=host-codex groups=1 jobs=1 base=https://api.telegram.org
+imcodex 2.2.3 started: config=/srv/imcodex/imcodex.yaml platform=telegram runtime=host-codex groups=1 jobs=1 base=https://api.telegram.org
 ```
